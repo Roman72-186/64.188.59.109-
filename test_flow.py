@@ -2,12 +2,12 @@
 """Автономный прогон всего потока прокладки на моках (без реальных Т-Банка/shalamo).
 
 Запуск:  python test_flow.py
-Мокает Т-Банк и shalamo.io, прогоняет ключевые сценарии и печатает PASS/FAIL.
+Мокает Т-Банк и shalamov.io, прогоняет ключевые сценарии и печатает PASS/FAIL.
 Проверяет: защиту токеном, создание платежа, назначение тега, идемпотентность
 (дубль webhook не ставит тег второй раз), отбраковку неверной подписи/суммы/статуса,
 возврат 503 при недоступности shalamo и повторную обработку.
 
-Это проверка ЛОГИКИ прокладки. Связку «тег -> авторассылка» в shalamo.io
+Это проверка ЛОГИКИ прокладки. Связку «тег -> авторассылка» в shalamov.io
 проверять отдельно при первом реальном платеже.
 """
 
@@ -52,7 +52,7 @@ class FakeTBank:
         self.ok = True
         self.state = StateResult(success=True, status="CONFIRMED", amount=9900)
 
-    async def init_payment(self, order_id, amount, description, notification_url=None, extra_params=None):
+    async def init_payment(self, order_id, amount, description, notification_url=None, extra_params=None, receipt=None):
         if self.ok:
             return InitResult(success=True, payment_id=f"pay_{order_id[-5:]}", pay_url=f"https://pay/{order_id}")
         return InitResult(success=False, error_code="99", message="declined")

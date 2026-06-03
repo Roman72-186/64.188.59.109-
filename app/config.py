@@ -73,6 +73,26 @@ class PaymentMethodConfig(BaseModel):
     extra_params: dict[str, Any] = Field(default_factory=dict)
 
 
+class ReceiptConfig(BaseModel):
+    """Чек 54-ФЗ для Т-Банка (передаётся в Init как объект Receipt).
+
+    Если блока нет в конфиге — чек не отправляется (для терминалов без
+    фискализации, напр. тестового). Боевой терминал с подключённой кассой
+    требует Receipt, иначе Init -> ошибка 309 {request.validate.expected.receipt}.
+
+    Контакт получателя чека (Email или Phone) обязателен по 54-ФЗ: берётся из
+    запроса /init-payment (поля email/phone), иначе из fallback ниже.
+    """
+
+    enabled: bool = True
+    taxation: str  # система налогообложения: usn_income | osn | usn_income_outcome | ...
+    tax: str = "none"  # НДС по умолчанию: none | vat0 | vat10 | vat20 | vat110 | vat120
+    email: str | None = None  # fallback-контакт для чека, если бот не передал
+    phone: str | None = None
+    payment_method: str | None = None  # признак способа расчёта, напр. full_prepayment
+    payment_object: str | None = None  # признак предмета расчёта, напр. service
+
+
 class ProductConfig(BaseModel):
     name: str
     amount: int = Field(gt=0, description="сумма в копейках")
@@ -80,6 +100,7 @@ class ProductConfig(BaseModel):
     payment_methods: list[str]
     tags_by_method: dict[str, str]
     variables: dict[str, Any] = Field(default_factory=dict)
+    tax: str | None = None  # переопределение ставки НДS для чека (иначе receipt.tax)
 
     @model_validator(mode="after")
     def _check_tags(self) -> "ProductConfig":
@@ -98,6 +119,8 @@ class AppConfig(BaseModel):
     shalamo: ShalamoConfig
     payment_methods: dict[str, PaymentMethodConfig]
     products: dict[str, ProductConfig]
+    # Чек 54-ФЗ. Если не задан — Receipt в Init не отправляется.
+    receipt: ReceiptConfig | None = None
 
     @model_validator(mode="after")
     def _cross_checks(self) -> "AppConfig":
@@ -129,6 +152,45 @@ class AppConfig(BaseModel):
     def merged_extra_params(self, method: str) -> dict[str, Any]:
         mc = self.payment_methods.get(method)
         return dict(mc.extra_params) if mc else {}
+
+    def build_receipt(
+        self,
+        product_id: str,
+        email: str | None = None,
+        phone: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Собрать объект Receipt (54-ФЗ) для Init Т-Банка.
+
+        Возвращает None, если чек выключен/не настроен (тогда Receipt не шлётся).
+        Чек состоит из одной позиции = оплачиваемый товар (сумма в копейках,
+        Amount = Price * Quantity). Контакт получателя — email/phone из запроса,
+        иначе fallback из конфига.
+        """
+        if self.receipt is None or not self.receipt.enabled:
+            return None
+        product = self.products.get(product_id)
+        if product is None:
+            return None
+        r = self.receipt
+        item: dict[str, Any] = {
+            "Name": product.name[:128],
+            "Price": product.amount,
+            "Quantity": 1,
+            "Amount": product.amount,
+            "Tax": product.tax or r.tax,
+        }
+        if r.payment_method:
+            item["PaymentMethod"] = r.payment_method
+        if r.payment_object:
+            item["PaymentObject"] = r.payment_object
+        receipt: dict[str, Any] = {"Taxation": r.taxation, "Items": [item]}
+        contact_email = email or r.email
+        contact_phone = phone or r.phone
+        if contact_email:
+            receipt["Email"] = contact_email
+        if contact_phone:
+            receipt["Phone"] = contact_phone
+        return receipt
 
 
 DEFAULT_CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.yaml")

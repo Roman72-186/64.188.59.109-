@@ -1,5 +1,5 @@
 [Unit]
-Description=TBank <-> shalamo.io payment proxy
+Description=TBank <-> shalamov.io payment proxy
 After=network.target
 
 [Service]

@@ -20,9 +20,12 @@ class InitStatus(str, Enum):
 
 
 class InitPaymentRequest(BaseModel):
-    contact_id: str = Field(..., min_length=1, description="внутренний ID контакта shalamo.io")
+    contact_id: str = Field(..., min_length=1, description="внутренний ID контакта shalamov.io")
     product_id: str = Field(..., min_length=1)
     payment_method: str = Field(..., min_length=1)
+    # Контакт для чека 54-ФЗ (опционально; иначе берётся fallback из config.receipt)
+    email: Optional[str] = Field(default=None, description="email покупателя для чека")
+    phone: Optional[str] = Field(default=None, description="телефон покупателя для чека")
 
 
 class InitPaymentResponse(BaseModel):

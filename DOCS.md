@@ -96,7 +96,7 @@ tbank_proxy/
     ├── config.py        # загрузка/валидация config.yaml (pydantic)
     ├── schemas.py       # схемы запроса/ответа + статусы /init-payment
     ├── tbank.py         # клиент Т-Банка: Init, GetState, подпись Token
-    ├── shalamo.py       # конфиг-адаптер shalamo.io (endpoint'ы из config.yaml — см. §9)
+    ├── shalamo.py       # конфиг-адаптер shalamov.io (endpoint'ы из config.yaml — см. §9)
     ├── database.py      # SQLite: платежи, идемпотентность (paid_at / tag_assigned_at)
     └── logging_setup.py # логи в файл+stdout, маскировка секретов
 ```
@@ -135,7 +135,7 @@ tbank:
   # тестовый: "https://rest-api-test.tinkoff.ru/v2"
 
 shalamo:
-  api_url: "https://api.shalamo.io"   # базовый URL API шалам.io
+  api_url: "https://api.shalamov.io"   # базовый URL API шалам.io
   api_key: "..."                       # ключ API шалам.io
 
 server:
@@ -201,6 +201,32 @@ payment_methods:
     extra_params:
       PayType: "O"
 ```
+
+### Блок чека (Receipt, 54-ФЗ)
+
+Боевой терминал Т-Банка с подключённой онлайн-кассой **требует объект `Receipt`**
+в каждом Init. Без него Init отклоняется с ошибкой
+`309 {request.validate.expected.receipt}`. Терминал без фискализации (и тестовый
+контур) чек не требует — тогда блок `receipt` не нужен (или `enabled: false`).
+
+```yaml
+receipt:
+  enabled: true
+  taxation: "usn_income"      # система налогообложения — указать СВОЮ
+  tax: "none"                 # ставка НДС позиции (для УСН обычно none)
+  payment_object: "service"   # признак предмета расчёта (курс/услуга = service)
+  payment_method: "full_prepayment"  # признак способа расчёта (предоплата)
+  email: ""                   # fallback-email для чека, если бот не передал
+  phone: ""                   # fallback-телефон
+```
+
+- Чек собирается автоматически из **одной позиции** = оплачиваемый товар:
+  `Name`/`Price`/`Amount` берутся из блока `products` (сумма в копейках).
+- Ставку НДС можно переопределить на товар: поле `tax` в блоке товара.
+- **Контакт получателя чека (Email или Phone) обязателен по 54-ФЗ.** Его шлёт бот
+  в `/init-payment` (необязательные поля `email`/`phone`); если бот не передал —
+  берётся `receipt.email`/`receipt.phone`. Если ни там, ни там — Т-Банк отклонит Init.
+- `Receipt` — вложенный объект и в подпись `Token` **не входит** (так и требует Т-Банк).
 
 ---
 
@@ -296,15 +322,15 @@ server {
 
 ## 9. Настройка шалам.io
 
-### 9.1 Настроить адаптер shalamo.io (в config.yaml, НЕ в коде)
+### 9.1 Настроить адаптер shalamov.io (в config.yaml, НЕ в коде)
 
 `app/shalamo.py` — конфиг-адаптер: путь, метод, тело запроса и схема авторизации
 берутся из блока `shalamo` в `config.yaml`. **Код трогать не нужно** — когда узнаешь
-реальный контракт API shalamo.io, правишь только конфиг:
+реальный контракт API shalamov.io, правишь только конфиг:
 
 ```yaml
 shalamo:
-  api_url: "https://api.shalamo.io"
+  api_url: "https://api.shalamov.io"
   api_key: "..."
   timeout_seconds: 3            # *2 попытки должно укладываться в таймаут webhook (~10с)
   auth:
@@ -312,16 +338,16 @@ shalamo:
     value_template: "Bearer {api_key}"   # поправь, если авторизация иная
   assign_tag:
     method: "POST"
-    path: "/contacts/tag"                # ← реальный endpoint shalamo.io
+    path: "/contacts/tag"                # ← реальный endpoint shalamov.io
     body_template: { contact_id: "{contact_id}", tag: "{tag}" }
   set_variables:
     method: "POST"
-    path: "/contacts/variables"          # ← реальный endpoint shalamo.io
+    path: "/contacts/variables"          # ← реальный endpoint shalamov.io
     body_template: { contact_id: "{contact_id}", variables: "{variables}" }
 ```
 
 Плейсхолдеры: `{contact_id}`, `{tag}` — строки; `{variables}` подставляется как
-объект (dict). Уточни у shalamo.io точный путь, формат тела и способ авторизации.
+объект (dict). Уточни у shalamov.io точный путь, формат тела и способ авторизации.
 
 > Тег — «гейт» доступа: именно его успешная установка запускает авторассылку.
 > Переменные отправляются перед тегом (best-effort). Если переменные не
@@ -495,13 +521,13 @@ sqlite3 payments.db "SELECT order_id, status, tag_name, created_at FROM payments
 `TerminalKey`/пароль, или сумма/параметры.
 
 **Платёж прошёл, но тег не назначился (`ТРЕБУЕТ РУЧНОГО РАЗБОРА`).**
-Оплата успешна, но shalamo.io не ответил после 2 быстрых попыток. Прокладка вернула
+Оплата успешна, но shalamov.io не ответил после 2 быстрых попыток. Прокладка вернула
 Т-Банку `503`, и Т-Банк будет **повторять webhook по своему расписанию** — при
-восстановлении shalamo.io тег назначится автоматически (платёж в статусе
+восстановлении shalamov.io тег назначится автоматически (платёж в статусе
 `processing`, `paid_at` проставлен, `tag_assigned_at` пуст). Ручной разбор нужен,
-только если Т-Банк исчерпал повторы: назначь тег вручную через API shalamo.io.
+только если Т-Банк исчерпал повторы: назначь тег вручную через API shalamov.io.
 Причина обычно в блоке `shalamo` в `config.yaml` (неверный путь/формат — см. §9.1)
-или временная недоступность shalamo.io. Найти зависшие платежи:
+или временная недоступность shalamov.io. Найти зависшие платежи:
 
 ```bash
 sqlite3 payments.db "SELECT order_id, last_error FROM payments WHERE paid_at IS NOT NULL AND tag_assigned_at IS NULL;"

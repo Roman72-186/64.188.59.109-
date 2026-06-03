@@ -42,9 +42,12 @@ class FakeTBank:
         self.init_calls: list[dict] = []
 
     async def init_payment(
-        self, order_id, amount, description, notification_url=None, extra_params=None
+        self, order_id, amount, description,
+        notification_url=None, extra_params=None, receipt=None
     ) -> InitResult:
-        self.init_calls.append({"order_id": order_id, "amount": amount})
+        self.init_calls.append(
+            {"order_id": order_id, "amount": amount, "receipt": receipt}
+        )
         if self.init_succeeds:
             return InitResult(
                 success=True,
@@ -76,9 +79,7 @@ class FakeShalamo:
         return [c for c in self.calls if c[0] == "tag"]
 
 
-@pytest.fixture
-def env(tmp_path):
-    cfg = make_config()
+def _make_env(cfg: AppConfig, tmp_path) -> SimpleNamespace:
     db = Database(str(tmp_path / "test.db"))
     db.init_db()
     tbank = FakeTBank()
@@ -89,6 +90,19 @@ def env(tmp_path):
         cfg=cfg, db=db, tbank=tbank, shalamo=shalamo, client=client,
         password=TEST_PASSWORD, secret=SECRET_TOKEN,
     )
+
+
+@pytest.fixture
+def env(tmp_path):
+    return _make_env(make_config(), tmp_path)
+
+
+@pytest.fixture
+def env_factory(tmp_path):
+    """Фабрика окружения с произвольным конфигом (для тестов чека и т.п.)."""
+    def _factory(cfg: AppConfig) -> SimpleNamespace:
+        return _make_env(cfg, tmp_path)
+    return _factory
 
 
 def signed_webhook(payload: dict, password: str = TEST_PASSWORD) -> dict:

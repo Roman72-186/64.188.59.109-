@@ -71,7 +71,7 @@ def create_app(
         log.info("Прокладка запущена. Товаров: %d", len(cfg.products))
         yield
 
-    app = FastAPI(title="TBank ↔ shalamo.io proxy", lifespan=lifespan)
+    app = FastAPI(title="TBank ↔ shalamov.io proxy", lifespan=lifespan)
 
     # ── выдача доступа (общий код для webhook и init-payment) ────────────────
 
@@ -188,12 +188,21 @@ def create_app(
             order_id, req.product_id, req.payment_method, product.amount,
         )
         notification_url = cfg.server.public_url.rstrip("/") + "/webhook/tbank"
+        receipt = cfg.build_receipt(req.product_id, email=req.email, phone=req.phone)
+        if cfg.receipt and cfg.receipt.enabled and receipt is not None:
+            if not receipt.get("Email") and not receipt.get("Phone"):
+                log.warning(
+                    "init-payment: чек включён, но нет Email/Phone order=%s — "
+                    "Т-Банк отклонит Init (передай email/phone или задай fallback)",
+                    order_id,
+                )
         init = await tbank_client.init_payment(
             order_id=order_id,
             amount=product.amount,
             description=product.description,
             notification_url=notification_url,
             extra_params=cfg.merged_extra_params(req.payment_method),
+            receipt=receipt,
         )
         if init.success and init.pay_url:
             database.update_init_result(order_id, init.payment_id or "", init.pay_url)

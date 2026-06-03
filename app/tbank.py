@@ -96,6 +96,7 @@ class TBankClient:
         description: str,
         notification_url: Optional[str] = None,
         extra_params: Optional[dict[str, Any]] = None,
+        receipt: Optional[dict[str, Any]] = None,
     ) -> InitResult:
         """Создать платёж (POST /Init). amount — в копейках."""
         params: dict[str, Any] = {
@@ -109,6 +110,10 @@ class TBankClient:
         if extra_params:
             # PayType и т.п. — корневые скалярные параметры, участвуют в подписи
             params.update(extra_params)
+        if receipt:
+            # Receipt — вложенный объект (54-ФЗ); в подпись Token НЕ входит
+            # (build_token отбрасывает dict/list). Т-Банк так и ожидает.
+            params["Receipt"] = receipt
 
         body = self._signed(params)
         try:
