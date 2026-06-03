@@ -1,0 +1,29 @@
+# Reverse proxy + HTTPS перед прокладкой. Т-Банк шлёт webhook только на HTTPS.
+# Сертификат: certbot --nginx. Домен: pay.sushi-house-39.ru
+# (при смене домена замени pay.sushi-house-39.ru во всех строках ниже).
+
+server {
+    listen 443 ssl;
+    server_name pay.sushi-house-39.ru;
+
+    ssl_certificate     /etc/letsencrypt/live/pay.sushi-house-39.ru/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/pay.sushi-house-39.ru/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # webhook Т-Банка: не подменять тело ответа (нужен ровно "OK"),
+        # дать времени на 2 попытки назначения тега
+        proxy_read_timeout 30s;
+    }
+}
+
+server {
+    listen 80;
+    server_name pay.sushi-house-39.ru;
+    return 301 https://$host$request_uri;
+}

@@ -1,0 +1,17 @@
+[Unit]
+Description=TBank <-> shalamo.io payment proxy
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/tbank_proxy
+Environment=CONFIG_PATH=/opt/tbank_proxy/config.yaml
+Environment=LOG_DIR=/opt/tbank_proxy/logs
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/tbank_proxy/venv/bin/uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

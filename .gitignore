@@ -1,0 +1,23 @@
+# secrets / local config — НИКОГДА не коммитить
+.env
+config.yaml
+*.pem
+*.key
+id_rsa*
+*_deploy
+*_deploy.pub
+
+# runtime
+payments.db
+payments.db-*
+logs/
+*.log
+
+# python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.egg-info/

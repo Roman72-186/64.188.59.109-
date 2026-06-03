@@ -1,0 +1,94 @@
+# ============================================================================
+#  Конфигурация прокладки Т-Банк <-> shalamo.io
+#  Скопировать в config.yaml и заполнить. config.yaml — в .gitignore.
+#  ВСЕ настройки проекта здесь. Код под конкретный проект не правится.
+# ============================================================================
+
+tbank:
+  terminal_key: "CHANGE_ME"          # TerminalKey из ЛК Т-Банка
+  terminal_password: "CHANGE_ME"     # пароль терминала (для подписи Token)
+  api_url: "https://securepay.tinkoff.ru/v2"   # боевой
+  # тестовый: "https://rest-api-test.tinkoff.ru/v2"
+  timeout_seconds: 15
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  public_url: "https://your-domain.ru"   # публичный адрес прокладки (для webhook Т-Банка)
+  # секрет для защиты /init-payment. Сгенерировать:
+  #   python -c "import secrets; print(secrets.token_hex(32))"
+  secret_token: "CHANGE_ME"
+
+# ── shalamo.io: конфиг-адаптер ──────────────────────────────────────────────
+# Когда узнаешь точные пути/формат — правишь ТОЛЬКО этот блок, код не трогаешь.
+# Плейсхолдеры (в query_template и body_template): {contact_id}, {tag},
+# {variables} (последний — JSON-объект переменных).
+# Авторизация: in: header (по умолчанию, заголовок) или in: query (?param=value).
+# Параметры можно слать через query_template (query-строка) и/или body_template
+# (JSON-тело); пустое body_template => тело не отправляется.
+shalamo:
+  # Реальный API shalamov.io (семейство WatBot): база включает /api/v1.
+  api_url: "https://app.shalamov.io/api/v1"
+  api_key: "CHANGE_ME"
+  # Таймаут одного запроса. Внутри webhook делается до 2 попыток, поэтому
+  # timeout_seconds * 2 должно укладываться в таймаут webhook Т-Банка (~10с).
+  timeout_seconds: 3
+  auth:
+    in: "query"                  # ключ уходит как ?api_token=...
+    param: "api_token"
+    value_template: "{api_key}"
+  # POST /attachTagToContact?api_token=...&contact_id=...&name=<тег>
+  assign_tag:
+    method: "POST"
+    path: "/attachTagToContact"
+    query_template:
+      contact_id: "{contact_id}"
+      name: "{tag}"
+    success_when:                # как определять успех ответа (опц.)
+      http_2xx: true
+  # Переменные контакта — опционально и best-effort. Если блок отсутствует/закомментирован,
+  # шаг пропускается (тег это не блокирует). Включить, когда известен реальный endpoint.
+  # set_variables:
+  #   method: "POST"
+  #   path: "/attachVariableToContact"
+  #   query_template:
+  #     contact_id: "{contact_id}"
+  #     name: "{variables}"
+  #   success_when:
+  #     http_2xx: true
+
+# ── Способы оплаты: общие доп. параметры Init Т-Банка ───────────────────────
+payment_methods:
+  card:
+    label: "Банковская карта"
+    extra_params: {}
+  sbp:
+    label: "СБП"
+    extra_params:
+      PayType: "O"
+  dolyami:
+    label: "Долями"
+    extra_params:
+      PayType: "O"
+  installment:
+    label: "Рассрочка"
+    extra_params:
+      PayType: "O"
+
+# ── Товары. Ключ словаря = product_id, который передаёт бот ─────────────────
+products:
+  course_basic:
+    name: "Курс: Базовый тариф"
+    amount: 9900                  # СУММА В КОПЕЙКАХ (9900 = 99 руб)
+    description: "Базовый тариф курса"
+    payment_methods:              # какие способы оплаты разрешены товару
+      - card
+      - sbp
+      - dolyami
+    tags_by_method:               # тег за каждый способ оплаты (товар+способ -> тег)
+      card: "paid_card_basic"
+      sbp: "paid_sbp_basic"
+      dolyami: "paid_dolyami_basic"
+    variables:                    # доп. переменные контакта (опционально)
+      product_name: "Базовый тариф"
+      access_level: "basic"

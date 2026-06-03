@@ -1,0 +1,324 @@
+"""FastAPI-приложение прокладки: /init-payment, /webhook/tbank, /health.
+
+Сборка через create_app(...) — компоненты (config, db, клиенты) можно
+инъектировать (тесты), иначе берутся из config.yaml.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import secrets
+from contextlib import asynccontextmanager
+from typing import Any, Optional
+
+from fastapi import FastAPI, Header, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
+
+from .config import AppConfig, get_config
+from .database import Database
+from .logging_setup import get_logger, setup_logging
+from .schemas import InitPaymentRequest, InitPaymentResponse, InitStatus
+from .shalamo import ShalamoClient
+from .tbank import TBankClient, verify_webhook_token
+
+log = get_logger()
+
+# Назначение тега в webhook: 2 быстрые попытки (PRD §7.8). Суммарное время с
+# учётом таймаута shalamo должно укладываться в таймаут webhook Т-Банка (~10с).
+WEBHOOK_TAG_ATTEMPTS = 2
+RETRY_BACKOFF_SECONDS = 0.3
+
+# Терминальные негативные статусы Т-Банка — переводим платёж в failed.
+NEGATIVE_TBANK_STATUSES = {"REJECTED", "DEADLINE_EXPIRED", "CANCELED", "AUTH_FAIL"}
+
+
+def _payment_variables(config: AppConfig, order: dict[str, Any]) -> dict[str, Any]:
+    """Платёжные переменные контакта (PRD §7.7) + переменные товара."""
+    rub = order["amount"] / 100
+    variables: dict[str, Any] = {
+        "payment_status": "paid",
+        "payment_method": order["payment_method"],
+        "payment_amount": int(rub) if float(rub).is_integer() else rub,
+        "payment_order_id": order["order_id"],
+        "payment_id": order.get("tbank_payment_id"),
+    }
+    product = config.get_product(order["product_id"])
+    if product:
+        variables.update(product.variables)
+    return variables
+
+
+def create_app(
+    config: Optional[AppConfig] = None,
+    db: Optional[Database] = None,
+    tbank: Optional[TBankClient] = None,
+    shalamo: Optional[ShalamoClient] = None,
+) -> FastAPI:
+    setup_logging()
+    cfg = config or get_config()
+    database = db or Database()
+    tbank_client = tbank or TBankClient(
+        terminal_key=cfg.tbank.terminal_key,
+        terminal_password=cfg.tbank.terminal_password,
+        api_url=cfg.tbank.api_url,
+        timeout_seconds=cfg.tbank.timeout_seconds,
+    )
+    shalamo_client = shalamo or ShalamoClient(cfg.shalamo)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        database.init_db()
+        log.info("Прокладка запущена. Товаров: %d", len(cfg.products))
+        yield
+
+    app = FastAPI(title="TBank ↔ shalamo.io proxy", lifespan=lifespan)
+
+    # ── выдача доступа (общий код для webhook и init-payment) ────────────────
+
+    async def grant_access(order: dict[str, Any], attempts: int) -> bool:
+        """Назначить контакту тег (+ переменные). Тег — гейт доступа: его успешная
+        установка запускает автоворонку. Переменные отправляются перед тегом
+        (best-effort), чтобы воронка стартовала уже с ними. Возвращает True при
+        успешной установке тега."""
+        contact_id = order["contact_id"]
+        tag = order["tag_name"]
+        variables = _payment_variables(cfg, order)
+        last_error: Optional[str] = None
+
+        for attempt in range(1, attempts + 1):
+            var_res = await shalamo_client.set_variables(contact_id, variables)
+            if not var_res.ok:
+                log.warning(
+                    "shalamo: переменные не установлены (попытка %d/%d) order=%s: %s",
+                    attempt, attempts, order["order_id"], var_res.error,
+                )
+            tag_res = await shalamo_client.assign_tag(contact_id, tag)
+            if tag_res.ok:
+                database.mark_tag_assigned(order["order_id"])
+                log.info(
+                    "✅ Платёж подтверждён order=%s тег=%s contact=%s",
+                    order["order_id"], tag, contact_id,
+                )
+                return True
+            last_error = tag_res.error
+            log.error(
+                "❌ Назначение тега не удалось (попытка %d/%d) order=%s: %s",
+                attempt, attempts, order["order_id"], last_error,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(RETRY_BACKOFF_SECONDS)
+
+        database.record_tag_error(order["order_id"], f"assign_tag failed: {last_error}")
+        log.error(
+            "❌ Доступ НЕ выдан order=%s — ТРЕБУЕТ РУЧНОГО РАЗБОРА", order["order_id"]
+        )
+        return False
+
+    # ── /init-payment ────────────────────────────────────────────────────────
+
+    @app.post("/init-payment", response_model=InitPaymentResponse)
+    async def init_payment(
+        req: InitPaymentRequest,
+        x_secret_token: Optional[str] = Header(default=None, alias="X-Secret-Token"),
+    ) -> JSONResponse:
+        # 1. секретный токен
+        if not x_secret_token or not secrets.compare_digest(
+            x_secret_token, cfg.server.secret_token
+        ):
+            log.warning("init-payment: неверный X-Secret-Token")
+            return _resp(InitStatus.FORBIDDEN, 403)
+
+        # 2. товар
+        product = cfg.get_product(req.product_id)
+        if product is None:
+            log.warning("init-payment: неизвестный product_id=%s", req.product_id)
+            return _resp(InitStatus.INVALID_PRODUCT, 400)
+
+        # 3. способ оплаты
+        if not cfg.is_method_allowed(req.product_id, req.payment_method):
+            log.warning(
+                "init-payment: способ '%s' недоступен товару '%s'",
+                req.payment_method, req.product_id,
+            )
+            return _resp(InitStatus.INVALID_PAYMENT_METHOD, 400)
+
+        # 4. товар уже оплачен (PRD §7.3)
+        paid = database.find_paid_order(req.contact_id, req.product_id)
+        if paid is not None:
+            if paid["tag_assigned_at"]:
+                log.info(
+                    "init-payment: уже оплачено и доступ выдан order=%s",
+                    paid["order_id"],
+                )
+                return _resp(
+                    InitStatus.ALREADY_PAID_ACCESS_GRANTED, 200,
+                    order_id=paid["order_id"], pay_url=paid["pay_url"],
+                )
+            log.info(
+                "init-payment: оплачено, но тег не назначен — пробуем назначить order=%s",
+                paid["order_id"],
+            )
+            ok = await grant_access(paid, attempts=1)
+            status = (
+                InitStatus.ALREADY_PAID_ACCESS_GRANTED if ok
+                else InitStatus.ALREADY_PAID_PENDING_ACCESS
+            )
+            return _resp(status, 200, order_id=paid["order_id"], pay_url=paid["pay_url"])
+
+        # 5. активная неоплаченная ссылка (PRD §7.2)
+        active = database.find_active_link(
+            req.contact_id, req.product_id, req.payment_method
+        )
+        if active is not None:
+            log.info("init-payment: возврат активной ссылки order=%s", active["order_id"])
+            return _resp(
+                InitStatus.EXISTING_ACTIVE, 200,
+                order_id=active["order_id"], pay_url=active["pay_url"],
+            )
+
+        # 6. создание нового платежа
+        order_id = f"{req.product_id}_{req.contact_id}_{secrets.token_hex(4)}"
+        tag = cfg.tag_for(req.product_id, req.payment_method)
+        database.create_payment(
+            order_id, req.contact_id, req.product_id, req.payment_method,
+            product.amount, tag,
+        )
+        log.info(
+            "init-payment: создан платёж order=%s product=%s method=%s amount=%d",
+            order_id, req.product_id, req.payment_method, product.amount,
+        )
+        notification_url = cfg.server.public_url.rstrip("/") + "/webhook/tbank"
+        init = await tbank_client.init_payment(
+            order_id=order_id,
+            amount=product.amount,
+            description=product.description,
+            notification_url=notification_url,
+            extra_params=cfg.merged_extra_params(req.payment_method),
+        )
+        if init.success and init.pay_url:
+            database.update_init_result(order_id, init.payment_id or "", init.pay_url)
+            log.info("init-payment: получена ссылка оплаты order=%s", order_id)
+            return _resp(
+                InitStatus.CREATED, 200, order_id=order_id, pay_url=init.pay_url
+            )
+
+        database.mark_failed(order_id, f"Init: {init.error_code} {init.message}")
+        log.error("init-payment: Т-Банк не создал платёж order=%s", order_id)
+        return _resp(
+            InitStatus.PAYMENT_CREATION_FAILED, 502, order_id=order_id,
+            message=init.message,
+        )
+
+    # ── /webhook/tbank ─────────────────────────────────────────────────────
+
+    @app.post("/webhook/tbank")
+    async def webhook_tbank(request: Request) -> PlainTextResponse:
+        try:
+            payload = await request.json()
+        except Exception:
+            log.error("webhook: тело не разобралось как JSON")
+            return PlainTextResponse("OK")
+
+        # 1. подпись
+        if not verify_webhook_token(payload, cfg.tbank.terminal_password):
+            log.error("webhook: НЕВЕРНАЯ ПОДПИСЬ — не обрабатываем как оплату")
+            return PlainTextResponse("OK")
+
+        order_id = payload.get("OrderId")
+        payment_id = payload.get("PaymentId")
+        tbank_status = payload.get("Status")
+        log.info(
+            "webhook Т-Банк: order=%s payment_id=%s status=%s",
+            order_id, payment_id, tbank_status,
+        )
+
+        # 2. найти заказ
+        order = None
+        if order_id:
+            order = database.get_by_order_id(str(order_id))
+        if order is None and payment_id:
+            order = database.get_by_tbank_payment_id(str(payment_id))
+        if order is None:
+            log.error("webhook: заказ не найден order=%s payment_id=%s", order_id, payment_id)
+            return PlainTextResponse("OK")
+
+        oid = order["order_id"]
+        database.set_tbank_status(oid, str(tbank_status))
+
+        # 3. не CONFIRMED — доступ не выдаём
+        if tbank_status != "CONFIRMED":
+            if tbank_status in NEGATIVE_TBANK_STATUSES:
+                database.mark_failed(oid, f"Т-Банк статус {tbank_status}")
+            log.info("webhook: статус %s — доступ не выдаём order=%s", tbank_status, oid)
+            return PlainTextResponse("OK")
+
+        # 4. CONFIRMED
+        # 4a. сверка суммы; при расхождении — доппроверка GetState (PRD §7.6)
+        wh_amount = payload.get("Amount")
+        if wh_amount != order["amount"]:
+            log.warning(
+                "webhook: сумма webhook=%s != заказ=%s order=%s — проверяем GetState",
+                wh_amount, order["amount"], oid,
+            )
+            state = await tbank_client.get_state(str(payment_id))
+            if not (
+                state.success
+                and state.status == "CONFIRMED"
+                and state.amount == order["amount"]
+            ):
+                log.error(
+                    "webhook: сумма не подтверждена GetState order=%s — доступ не выдаём", oid
+                )
+                return PlainTextResponse("OK")
+            log.info("webhook: сумма подтверждена через GetState order=%s", oid)
+
+        # 4b. идемпотентность: тег уже назначен
+        if order["tag_assigned_at"]:
+            log.info("webhook: повторный — тег уже назначен order=%s, пропускаем", oid)
+            return PlainTextResponse("OK")
+
+        # фиксируем факт оплаты банком
+        database.mark_paid(oid, str(tbank_status))
+
+        # 4c. атомарный захват (защита от дублей)
+        if not database.atomic_capture(oid):
+            fresh = database.get_by_order_id(oid)
+            if fresh and fresh["tag_assigned_at"]:
+                log.info("webhook: параллельный — тег уже назначен order=%s", oid)
+            else:
+                log.info("webhook: order=%s обрабатывается параллельно, пропускаем", oid)
+            return PlainTextResponse("OK")
+
+        # 4d. назначение тега, 2 попытки
+        ok = await grant_access(order, attempts=WEBHOOK_TAG_ATTEMPTS)
+        if ok:
+            return PlainTextResponse("OK")
+
+        # 4f. обе попытки неуспешны — НЕ возвращаем OK, отдаём 503 (PRD §7.8)
+        log.error("webhook: возвращаем 503 order=%s — Т-Банк повторит webhook", oid)
+        return PlainTextResponse("Service Unavailable", status_code=503)
+
+    # ── /health ──────────────────────────────────────────────────────────────
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    return app
+
+
+# Запуск: uvicorn app.main:create_app --factory
+# (фабрика вызывается на старте; неверный config.yaml падает с понятной ошибкой).
+
+
+def _resp(
+    status: InitStatus,
+    http_code: int,
+    order_id: Optional[str] = None,
+    pay_url: Optional[str] = None,
+    message: Optional[str] = None,
+) -> JSONResponse:
+    payload = InitPaymentResponse(
+        status=status, order_id=order_id, pay_url=pay_url, message=message
+    )
+    return JSONResponse(status_code=http_code, content=payload.model_dump())
