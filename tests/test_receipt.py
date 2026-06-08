@@ -109,6 +109,25 @@ def test_init_payment_passes_receipt(env_factory):
     assert receipt["Items"][0]["Amount"] == 9900
 
 
+def test_amount_override_reflected_in_receipt(env_factory):
+    """Сумма, переданная платформой в /init-payment, должна попасть в Receipt —
+    иначе Init и Receipt разойдутся и Т-Банк отклонит платёж."""
+    env = env_factory(_cfg_with_receipt())
+    resp = env.client.post(
+        "/init-payment",
+        headers={"X-Secret-Token": SECRET_TOKEN},
+        json={
+            "contact_id": "c1", "product_id": "course_basic",
+            "payment_method": "card", "email": "buyer@example.com", "amount": 12345,
+        },
+    )
+    assert resp.status_code == 200
+    receipt = env.tbank.init_calls[-1]["receipt"]
+    assert receipt["Items"][0]["Price"] == 12345
+    assert receipt["Items"][0]["Amount"] == 12345
+    assert env.tbank.init_calls[-1]["amount"] == 12345
+
+
 def test_init_payment_no_receipt_when_disabled(env):
     """Без блока receipt в Init уходит receipt=None (обратная совместимость)."""
     resp = env.client.post(

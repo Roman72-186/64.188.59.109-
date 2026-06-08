@@ -23,6 +23,10 @@ class InitPaymentRequest(BaseModel):
     contact_id: str = Field(..., min_length=1, description="внутренний ID контакта shalamov.io")
     product_id: str = Field(..., min_length=1)
     payment_method: str = Field(..., min_length=1)
+    # Опционально переопределяет сумму товара из config.yaml (в копейках). Запрос
+    # идёт по секретному токену от доверенной платформы (shalamov.io/бот) — конечный
+    # клиент его не видит и подменить сумму не может.
+    amount: Optional[int] = Field(default=None, gt=0, description="сумма в копейках — переопределяет product.amount")
     # Контакт для чека 54-ФЗ (опционально; иначе берётся fallback из config.receipt)
     email: Optional[str] = Field(default=None, description="email покупателя для чека")
     phone: Optional[str] = Field(default=None, description="телефон покупателя для чека")

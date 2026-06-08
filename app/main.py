@@ -179,10 +179,10 @@ def create_app(
     # ── создание платежа через прямой Долями ─────────────────────────────────
 
     async def init_dolyame_payment(
-        order_id: str, product: Any, req: InitPaymentRequest
+        order_id: str, product: Any, amount: int, req: InitPaymentRequest
     ) -> JSONResponse:
         """Создать заказ в прямом Partner API Долями и вернуть link как pay_url."""
-        items = [build_item(product.name, product.amount)]
+        items = [build_item(product.name, amount)]
         client_info: dict[str, Any] = {}
         if req.phone:
             client_info["phone"] = req.phone
@@ -191,7 +191,7 @@ def create_app(
         notification_url = cfg.server.public_url.rstrip("/") + "/webhook/dolyame"
         res = await dolyame_client.create(
             order_id=order_id,
-            amount_kopecks=product.amount,
+            amount_kopecks=amount,
             items=items,
             client_info=client_info or None,
             notification_url=notification_url,
@@ -271,23 +271,29 @@ def create_app(
             )
 
         # 6. создание нового платежа
+        # Сумма: платформа (shalamov.io/бот) может передать своё значение в копейках —
+        # запрос идёт по секретному токену, конечный клиент его не видит и не может
+        # подменить. Если не передано — берём фиксированную сумму товара из config.yaml.
+        amount = req.amount if req.amount is not None else product.amount
         order_id = f"{req.product_id}_{req.contact_id}_{secrets.token_hex(4)}"
         tag = cfg.tag_for(req.product_id, req.payment_method)
         database.create_payment(
             order_id, req.contact_id, req.product_id, req.payment_method,
-            product.amount, tag,
+            amount, tag,
         )
         log.info(
             "init-payment: создан платёж order=%s product=%s method=%s amount=%d",
-            order_id, req.product_id, req.payment_method, product.amount,
+            order_id, req.product_id, req.payment_method, amount,
         )
 
         # 6a. прямой Долями — отдельный провайдер (не эквайринг Т-Банка)
         if cfg.provider_for_method(req.payment_method) == "dolyame":
-            return await init_dolyame_payment(order_id, product, req)
+            return await init_dolyame_payment(order_id, product, amount, req)
 
         notification_url = cfg.server.public_url.rstrip("/") + "/webhook/tbank"
-        receipt = cfg.build_receipt(req.product_id, email=req.email, phone=req.phone)
+        receipt = cfg.build_receipt(
+            req.product_id, email=req.email, phone=req.phone, amount=amount
+        )
         if cfg.receipt and cfg.receipt.enabled and receipt is not None:
             if not receipt.get("Email") and not receipt.get("Phone"):
                 log.warning(
@@ -297,7 +303,7 @@ def create_app(
                 )
         init = await client_for_method(req.payment_method).init_payment(
             order_id=order_id,
-            amount=product.amount,
+            amount=amount,
             description=product.description,
             notification_url=notification_url,
             extra_params=cfg.merged_extra_params(req.payment_method),

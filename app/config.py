@@ -294,25 +294,29 @@ class AppConfig(BaseModel):
         product_id: str,
         email: str | None = None,
         phone: str | None = None,
+        amount: int | None = None,
     ) -> dict[str, Any] | None:
         """Собрать объект Receipt (54-ФЗ) для Init Т-Банка.
 
         Возвращает None, если чек выключен/не настроен (тогда Receipt не шлётся).
         Чек состоит из одной позиции = оплачиваемый товар (сумма в копейках,
         Amount = Price * Quantity). Контакт получателя — email/phone из запроса,
-        иначе fallback из конфига.
+        иначе fallback из конфига. `amount` переопределяет сумму товара (если
+        платформа передала свою сумму в /init-payment) — иначе Init и Receipt
+        разойдутся и Т-Банк отклонит платёж.
         """
         if self.receipt is None or not self.receipt.enabled:
             return None
         product = self.products.get(product_id)
         if product is None:
             return None
+        item_amount = amount if amount is not None else product.amount
         r = self.receipt
         item: dict[str, Any] = {
             "Name": product.name[:128],
-            "Price": product.amount,
+            "Price": item_amount,
             "Quantity": 1,
-            "Amount": product.amount,
+            "Amount": item_amount,
             "Tax": product.tax or r.tax,
         }
         if r.payment_method:

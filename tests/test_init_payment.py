@@ -82,6 +82,22 @@ def test_already_paid_reassigns_tag_success(env):
     assert env.db.get_by_order_id(order_id)["tag_assigned_at"] is not None
 
 
+def test_amount_override_used_instead_of_config(env):
+    # платформа передаёт свою сумму — она должна уйти в Init и сохраниться в БД
+    r = _post(env, dict(BASIC, amount=12345), token=env.secret)
+    assert r.status_code == 200
+    order_id = r.json()["order_id"]
+    assert env.tbank.init_calls[-1]["amount"] == 12345
+    assert env.db.get_by_order_id(order_id)["amount"] == 12345
+
+
+def test_amount_omitted_falls_back_to_config(env):
+    r = _post(env, BASIC, token=env.secret)
+    assert r.status_code == 200
+    order_id = r.json()["order_id"]
+    assert env.db.get_by_order_id(order_id)["amount"] == 9900
+
+
 def test_already_paid_pending_when_shalamo_down(env):
     order_id = _post(env, BASIC, token=env.secret).json()["order_id"]
     env.db.mark_paid(order_id)
