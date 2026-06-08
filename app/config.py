@@ -161,6 +161,11 @@ class ProductConfig(BaseModel):
     description: str = ""
     payment_methods: list[str]
     tags_by_method: dict[str, str]
+    # Тег «отказ оплаты» по способу (товар+способ -> тег). ОПЦИОНАЛЬНО: назначается
+    # только если для способа задан тег. Сейчас используется для Долями (terminal
+    # negative: rejected/canceled). Если способа здесь нет — тег отказа не шлётся,
+    # поведение прежнее. Это не гейт доступа, а триггер авторассылки «оплата не прошла».
+    fail_tags_by_method: dict[str, str] = Field(default_factory=dict)
     variables: dict[str, Any] = Field(default_factory=dict)
     tax: str | None = None  # переопределение ставки НДS для чека (иначе receipt.tax)
 
@@ -272,6 +277,13 @@ class AppConfig(BaseModel):
         if not product:
             return None
         return product.tags_by_method.get(method)
+
+    def fail_tag_for(self, product_id: str, method: str) -> str | None:
+        """Тег «отказ оплаты» для способа (None, если не задан → тег не шлётся)."""
+        product = self.products.get(product_id)
+        if not product:
+            return None
+        return product.fail_tags_by_method.get(method)
 
     def merged_extra_params(self, method: str) -> dict[str, Any]:
         mc = self.payment_methods.get(method)

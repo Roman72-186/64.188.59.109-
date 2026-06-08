@@ -133,10 +133,15 @@ products:
       - card
       - sbp
       - dolyami
-    tags_by_method:               # тег за каждый способ оплаты (товар+способ -> тег)
+    tags_by_method:               # тег УСПЕХА за каждый способ оплаты (товар+способ -> тег)
       card: "paid_card_basic"
       sbp: "paid_sbp_basic"
       dolyami: "paid_dolyami_basic"
+    fail_tags_by_method:          # тег ОТКАЗА (опц.): назначается при terminal-негативе
+                                  # провайдера (Долями rejected/canceled). Только для
+                                  # способов, перечисленных здесь; иначе тег не шлётся.
+                                  # Не гейт доступа — триггер авторассылки «оплата не прошла».
+      dolyami: "fail_dolyami_basic"
     variables:                    # доп. переменные контакта (опционально)
       product_name: "Базовый тариф"
       access_level: "basic"

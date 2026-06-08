@@ -251,6 +251,48 @@ def test_webhook_rejected_status_fails(env):
     assert env.dolyame.commit_calls == []
 
 
+# ── webhook: тег ОТКАЗА (fail_tags_by_method) ────────────────────────────────
+
+
+@pytest.mark.parametrize("neg_status", ["rejected", "canceled"])
+def test_webhook_negative_assigns_fail_tag(env, neg_status):
+    """Терминальный негатив Долями -> назначается тег отказа (не тег успеха)."""
+    order = _init_order(env)
+    env.dolyame.status = neg_status
+    r = _webhook(env, order["order_id"], status=neg_status)
+    assert r.status_code == 200 and r.text == "OK"
+    row = env.db.get_by_order_id(order["order_id"])
+    assert row["status"] == "failed"
+    assert row["tag_assigned_at"] is None          # тег успеха НЕ назначен
+    assert row["fail_tag_assigned_at"] is not None  # тег отказа назначен
+    assert env.shalamo.tag_calls == [("tag", "c1", "fail_dolyami_basic")]
+    assert env.dolyame.commit_calls == []
+
+
+def test_webhook_fail_tag_idempotent_on_duplicate(env):
+    """Повторный негативный webhook не переназначает тег отказа."""
+    order = _init_order(env)
+    env.dolyame.status = "rejected"
+    _webhook(env, order["order_id"], status="rejected")
+    _webhook(env, order["order_id"], status="rejected")  # дубль
+    assert env.shalamo.tag_calls == [("tag", "c1", "fail_dolyami_basic")]  # ровно один
+
+
+def test_webhook_no_fail_tag_configured_no_tag(tmp_path):
+    """Если для способа нет fail_tags_by_method — тег отказа не шлётся (прежнее поведение)."""
+    cfg = make_config()
+    cfg.products["course_basic"].fail_tags_by_method.clear()  # способ без тега отказа
+    env = _make_env(cfg, tmp_path)
+    order = _init_order(env)
+    env.dolyame.status = "rejected"
+    r = _webhook(env, order["order_id"], status="rejected")
+    assert r.status_code == 200 and r.text == "OK"
+    row = env.db.get_by_order_id(order["order_id"])
+    assert row["status"] == "failed"
+    assert row["fail_tag_assigned_at"] is None
+    assert env.shalamo.tag_calls == []  # ни одного тега
+
+
 def test_webhook_unknown_order_ok(env):
     r = _webhook(env, "ghost-order")
     assert r.status_code == 200 and r.text == "OK"

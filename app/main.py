@@ -144,6 +144,38 @@ def create_app(
         )
         return False
 
+    async def assign_failure_tag(
+        order: dict[str, Any], tag: str, attempts: int
+    ) -> bool:
+        """Назначить контакту тег ОТКАЗА оплаты (триггер авторассылки «оплата не
+        прошла»). В отличие от grant_access: переменные не шлём (для отказа не
+        нужны), это не гейт доступа. Возвращает True при успешной установке.
+        При неудаче shalamo — best-effort: пишем ошибку в лог, НЕ 503 (у отказа
+        нет paid_at, значит нет страховки через /init-payment; вызывающий
+        возвращает OK в любом случае)."""
+        contact_id = order["contact_id"]
+        last_error: Optional[str] = None
+        for attempt in range(1, attempts + 1):
+            tag_res = await shalamo_client.assign_tag(contact_id, tag)
+            if tag_res.ok:
+                database.mark_fail_tag_assigned(order["order_id"])
+                log.info(
+                    "⛔ Отказ оплаты — тег отказа назначен order=%s тег=%s contact=%s",
+                    order["order_id"], tag, contact_id,
+                )
+                return True
+            last_error = tag_res.error
+            log.error(
+                "❌ Тег отказа не назначен (попытка %d/%d) order=%s: %s",
+                attempt, attempts, order["order_id"], last_error,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(RETRY_BACKOFF_SECONDS)
+        database.record_tag_error(
+            order["order_id"], f"assign_fail_tag failed: {last_error}"
+        )
+        return False
+
     # ── создание платежа через прямой Долями ─────────────────────────────────
 
     async def init_dolyame_payment(
@@ -420,10 +452,16 @@ def create_app(
             return PlainTextResponse("Service Unavailable", status_code=503)
         database.set_tbank_status(oid, str(info.status))
 
-        # 4. терминальный негатив — доступ не выдаём
+        # 4. терминальный негатив — доступ не выдаём; назначаем тег ОТКАЗА
+        # (если задан для способа) как триггер авторассылки «оплата не прошла».
         if info.status in STATUS_TERMINAL_NEGATIVE:
             database.mark_failed(oid, f"Долями статус {info.status}")
             log.info("webhook Долями: статус %s order=%s — отказ", info.status, oid)
+            fail_tag = cfg.fail_tag_for(order["product_id"], order["payment_method"])
+            if fail_tag and database.capture_fail_tag(oid):
+                await assign_failure_tag(order, fail_tag, attempts=WEBHOOK_TAG_ATTEMPTS)
+            # best-effort: отказ не блокирует ответ, всегда OK (нет paid_at → нет
+            # страховки через /init-payment, Долями может не повторить webhook).
             return PlainTextResponse("OK")
 
         # 5. оплата ещё не произошла (new/approved) — ждём

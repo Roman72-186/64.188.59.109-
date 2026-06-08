@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS payments (
     tag_name          TEXT,
     paid_at           TEXT,                         -- банк подтвердил оплату (CONFIRMED)
     tag_assigned_at   TEXT,                         -- тег успешно назначен в shalamo
+    fail_tag_assigned_at TEXT,                       -- тег ОТКАЗА назначен (отдельный факт)
     last_error        TEXT,
     created_at        TEXT    NOT NULL,
     updated_at        TEXT    NOT NULL
@@ -83,6 +84,15 @@ class Database:
     def init_db(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Лёгкие миграции для уже существующих БД (CREATE TABLE IF NOT EXISTS
+        не добавляет новые столбцы в существующую таблицу). Идемпотентно."""
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(payments)")}
+        if "fail_tag_assigned_at" not in cols:
+            conn.execute("ALTER TABLE payments ADD COLUMN fail_tag_assigned_at TEXT")
 
     # ── чтение ──────────────────────────────────────────────────────────────
 
@@ -250,5 +260,34 @@ class Database:
                 "UPDATE payments SET tag_assigned_at = COALESCE(tag_assigned_at, ?), "
                 "status = 'confirmed', last_error = NULL, updated_at = ? "
                 "WHERE order_id = ?",
+                (now, now, order_id),
+            )
+
+    # ── тег отказа (отдельный факт, не гейт доступа) ─────────────────────────
+
+    def capture_fail_tag(self, order_id: str) -> bool:
+        """Захватить платёж под назначение тега ОТКАЗА. True — захватили,
+        False — тег отказа уже назначен (повторный/параллельный webhook) ИЛИ
+        успех уже выдан (тег отказа на оплаченный заказ не ставим).
+
+        Условие: ни тег отказа, ни успешный тег ещё не назначены. Статус
+        переводим в 'failed'."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE payments SET status = 'failed', updated_at = ? "
+                "WHERE order_id = ? AND fail_tag_assigned_at IS NULL "
+                "  AND tag_assigned_at IS NULL",
+                (_utcnow(), order_id),
+            )
+            return cur.rowcount == 1
+
+    def mark_fail_tag_assigned(self, order_id: str) -> None:
+        """Тег отказа успешно назначен. Фиксируем факт; статус остаётся 'failed'."""
+        now = _utcnow()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE payments SET "
+                "fail_tag_assigned_at = COALESCE(fail_tag_assigned_at, ?), "
+                "status = 'failed', updated_at = ? WHERE order_id = ?",
                 (now, now, order_id),
             )

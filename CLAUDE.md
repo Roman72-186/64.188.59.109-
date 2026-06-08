@@ -33,7 +33,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 venv\Scripts\pip install -r requirements.txt        # Windows
 cp config.example.yaml config.yaml                  # заполнить ключи + secret_token
 
-venv\Scripts\python -m pytest -q                    # 58 тестов: unit + интеграционные
+venv\Scripts\python -m pytest -q                    # 62 теста: unit + интеграционные
 venv\Scripts\python test_flow.py                    # автономный прогон потока на моках
 venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск; GET /health -> {"status":"ok"}
 ```
