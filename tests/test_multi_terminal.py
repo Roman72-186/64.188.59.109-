@@ -89,7 +89,7 @@ def _make_env_mt(env_factory):
 
 
 def _create_dolyami_order(env) -> dict:
-    body = {"contact_id": "c1", "product_id": "course_basic", "payment_method": "dolyami"}
+    body = {"contact_id": "c1", "product_id": "course_basic", "payment_method": "dolyami", "amount": 9900}
     order_id = env.client.post(
         "/init-payment", json=body, headers={"X-Secret-Token": env.secret}
     ).json()["order_id"]

@@ -133,7 +133,7 @@ def env(tmp_path):
     return _make_env(make_config(), tmp_path)
 
 
-BASIC = {"contact_id": "c1", "product_id": "course_basic", "payment_method": "dolyami"}
+BASIC = {"contact_id": "c1", "product_id": "course_basic", "payment_method": "dolyami", "amount": 9900}
 
 
 def _init_order(env) -> dict:

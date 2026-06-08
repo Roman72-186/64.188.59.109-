@@ -39,7 +39,7 @@ def _cfg_with_receipt(**receipt_overrides) -> AppConfig:
 
 def test_build_receipt_structure():
     cfg = _cfg_with_receipt()
-    r = cfg.build_receipt("course_basic", email="buyer@example.com")
+    r = cfg.build_receipt("course_basic", email="buyer@example.com", amount=9900)
     assert r["Taxation"] == "usn_income"
     assert r["Email"] == "buyer@example.com"  # из запроса, не fallback
     assert "Phone" not in r
@@ -56,7 +56,7 @@ def test_build_receipt_structure():
 
 def test_build_receipt_fallback_contact():
     cfg = _cfg_with_receipt()
-    r = cfg.build_receipt("course_basic")  # бот не передал email/phone
+    r = cfg.build_receipt("course_basic", amount=9900)  # бот не передал email/phone
     assert r["Email"] == "fallback@example.com"
 
 
@@ -99,7 +99,7 @@ def test_init_payment_passes_receipt(env_factory):
         headers={"X-Secret-Token": SECRET_TOKEN},
         json={
             "contact_id": "c1", "product_id": "course_basic",
-            "payment_method": "card", "email": "buyer@example.com",
+            "payment_method": "card", "email": "buyer@example.com", "amount": 9900,
         },
     )
     assert resp.status_code == 200
@@ -133,7 +133,7 @@ def test_init_payment_no_receipt_when_disabled(env):
     resp = env.client.post(
         "/init-payment",
         headers={"X-Secret-Token": SECRET_TOKEN},
-        json={"contact_id": "c1", "product_id": "course_basic", "payment_method": "card"},
+        json={"contact_id": "c1", "product_id": "course_basic", "payment_method": "card", "amount": 9900},
     )
     assert resp.status_code == 200
     assert env.tbank.init_calls[-1]["receipt"] is None

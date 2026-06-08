@@ -272,10 +272,7 @@ def create_app(
                 )
 
         # 6. создание нового платежа
-        # Сумма: платформа (shalamov.io/бот) может передать своё значение в копейках —
-        # запрос идёт по секретному токену, конечный клиент его не видит и не может
-        # подменить. Если не передано — берём фиксированную сумму товара из config.yaml.
-        amount = req.amount if req.amount is not None else product.amount
+        amount = req.amount  # сумма всегда от платформы (обязательное поле)
         order_id = f"{req.product_id}_{req.contact_id}_{secrets.token_hex(4)}"
         tag = cfg.tag_for(req.product_id, req.payment_method)
         database.create_payment(

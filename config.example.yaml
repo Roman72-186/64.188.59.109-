@@ -127,7 +127,8 @@ payment_methods:
 products:
   course_basic:
     name: "Курс: Базовый тариф"
-    amount: 9900                  # СУММА В КОПЕЙКАХ (9900 = 99 руб)
+    # amount не задаётся — платформа (бот/shalamov.io) всегда передаёт сумму
+    # в поле amount запроса /init-payment (в копейках: 9900 = 99 руб)
     description: "Базовый тариф курса"
     payment_methods:              # какие способы оплаты разрешены товару
       - card

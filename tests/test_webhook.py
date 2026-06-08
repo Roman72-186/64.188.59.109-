@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from app.tbank import build_token
 
-BASIC = {"contact_id": "c1", "product_id": "course_basic", "payment_method": "card"}
+BASIC = {"contact_id": "c1", "product_id": "course_basic", "payment_method": "card", "amount": 9900}
 
 
 def signed_webhook(payload: dict, password: str = "testpw") -> dict:

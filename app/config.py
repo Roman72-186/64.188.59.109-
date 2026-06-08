@@ -157,7 +157,7 @@ class ReceiptConfig(BaseModel):
 
 class ProductConfig(BaseModel):
     name: str
-    amount: int = Field(gt=0, description="сумма в копейках")
+    amount: int | None = Field(default=None, gt=0, description="сумма в копейках (необязательно — платформа передаёт в запросе)")
     description: str = ""
     payment_methods: list[str]
     tags_by_method: dict[str, str]
