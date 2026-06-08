@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
@@ -18,11 +19,38 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 # ── pydantic-модели конфигурации ────────────────────────────────────────────
 
 
+class TerminalCredentials(BaseModel):
+    """Реквизиты дополнительного терминала Т-Банка (отдельного магазина).
+
+    Используется, когда отдельный способ оплаты (напр. Долями) должен идти
+    через отдельный магазин, чтобы платёжная форма показывала только его.
+    api_url/timeout_seconds наследуются от основного терминала, если не заданы.
+    """
+
+    terminal_key: str
+    terminal_password: str
+    api_url: str | None = None
+    timeout_seconds: float | None = None
+
+
 class TBankConfig(BaseModel):
     terminal_key: str
     terminal_password: str
     api_url: str
     timeout_seconds: float = 15.0
+    # Доп. терминалы (отдельные магазины) под конкретные способы оплаты.
+    # Ключ словаря — имя, на которое ссылается payment_methods[*].terminal.
+    extra_terminals: dict[str, TerminalCredentials] = Field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ResolvedTerminal:
+    """Разрешённые реквизиты терминала (наследование от основного уже применено)."""
+
+    terminal_key: str
+    terminal_password: str
+    api_url: str
+    timeout_seconds: float
 
 
 class ServerConfig(BaseModel):
@@ -68,9 +96,43 @@ class ShalamoConfig(BaseModel):
     set_variables: ShalamoEndpoint | None = None
 
 
+class DolyameConfig(BaseModel):
+    """Прямой Partner API Долями (partner.dolyame.ru): mTLS + Basic.
+
+    Отдельный провайдер оплаты, не эквайринг Т-Банка (нужна Долями-only форма).
+    cert_path/key_path — клиентский сертификат mTLS, ОБЯЗАТЕЛЕН на живой вызов;
+    пустые значения допустимы для каркаса на моках (TLS-handshake тогда не пройдёт).
+    """
+
+    base_url: str = "https://partner.dolyame.ru"
+    login: str
+    password: str
+    cert_path: str = ""
+    key_path: str = ""
+    timeout_seconds: float = 5.0
+    # Фискализация через Долями: "disabled" (по умолчанию) | "enabled".
+    fiscalization: str = "disabled"
+    # Двухфазность: при webhook со статусом wait_for_commit синхронно вызвать commit
+    # (захват холда), затем назначить тег. False — назначать тег уже на wait_for_commit
+    # (холд без захвата). По умолчанию True (рекомендация: commit → committed → тег).
+    commit_on_webhook: bool = True
+    # Подсеть, с которой принимаются webhook'и Долями (CIDR). Прочие источники игнорим.
+    webhook_allowed_subnet: str = "91.194.226.0/23"
+
+    def fiscalization_settings(self) -> dict[str, Any]:
+        """Объект fiscalization_settings для тела запросов Долями (oneOf по type)."""
+        if self.fiscalization == "enabled":
+            return {"type": "enabled"}
+        return {"type": "disabled"}
+
+
 class PaymentMethodConfig(BaseModel):
     label: str
     extra_params: dict[str, Any] = Field(default_factory=dict)
+    # Имя терминала из tbank.extra_terminals. None = основной терминал.
+    terminal: str | None = None
+    # Провайдер оплаты: "tbank" (эквайринг, по умолчанию) | "dolyame" (прямой Partner API).
+    provider: str = "tbank"
 
 
 class ReceiptConfig(BaseModel):
@@ -121,6 +183,8 @@ class AppConfig(BaseModel):
     products: dict[str, ProductConfig]
     # Чек 54-ФЗ. Если не задан — Receipt в Init не отправляется.
     receipt: ReceiptConfig | None = None
+    # Прямой Partner API Долями. Если не задан — способы с provider='dolyame' запрещены.
+    dolyame: DolyameConfig | None = None
 
     @model_validator(mode="after")
     def _cross_checks(self) -> "AppConfig":
@@ -132,7 +196,67 @@ class AppConfig(BaseModel):
                         f"товар '{pid}': способ оплаты '{method}' "
                         f"отсутствует в payment_methods"
                     )
+        # Ссылка способа оплаты на терминал должна существовать в extra_terminals.
+        for name, mc in self.payment_methods.items():
+            if mc.terminal and mc.terminal not in self.tbank.extra_terminals:
+                raise ValueError(
+                    f"способ оплаты '{name}': терминал '{mc.terminal}' "
+                    f"отсутствует в tbank.extra_terminals"
+                )
+            if mc.provider not in ("tbank", "dolyame"):
+                raise ValueError(
+                    f"способ оплаты '{name}': неизвестный provider '{mc.provider}' "
+                    f"(допустимо: tbank | dolyame)"
+                )
+            # Прямой Долями требует блока dolyame в конфиге.
+            if mc.provider == "dolyame" and self.dolyame is None:
+                raise ValueError(
+                    f"способ оплаты '{name}': provider='dolyame', но блок 'dolyame' "
+                    f"в конфиге отсутствует"
+                )
         return self
+
+    def provider_for_method(self, method: str) -> str:
+        """Провайдер оплаты способа: 'tbank' (эквайринг) | 'dolyame' (прямой API)."""
+        mc = self.payment_methods.get(method)
+        return mc.provider if mc else "tbank"
+
+    # ── терминалы (основной + доп. магазины) ────────────────────────────────
+
+    def resolved_terminals(self) -> dict[str, ResolvedTerminal]:
+        """Все терминалы по terminal_key: основной + extra (наследование применено)."""
+        out: dict[str, ResolvedTerminal] = {
+            self.tbank.terminal_key: ResolvedTerminal(
+                terminal_key=self.tbank.terminal_key,
+                terminal_password=self.tbank.terminal_password,
+                api_url=self.tbank.api_url,
+                timeout_seconds=self.tbank.timeout_seconds,
+            )
+        }
+        for t in self.tbank.extra_terminals.values():
+            out[t.terminal_key] = ResolvedTerminal(
+                terminal_key=t.terminal_key,
+                terminal_password=t.terminal_password,
+                api_url=t.api_url or self.tbank.api_url,
+                timeout_seconds=(
+                    t.timeout_seconds
+                    if t.timeout_seconds is not None
+                    else self.tbank.timeout_seconds
+                ),
+            )
+        return out
+
+    def terminal_key_for_method(self, method: str) -> str:
+        """terminal_key, через который проводится этот способ оплаты."""
+        mc = self.payment_methods.get(method)
+        if mc and mc.terminal:
+            return self.tbank.extra_terminals[mc.terminal].terminal_key
+        return self.tbank.terminal_key
+
+    def password_for_terminal_key(self, terminal_key: str) -> str | None:
+        """Пароль терминала по его TerminalKey (для проверки подписи webhook)."""
+        t = self.resolved_terminals().get(terminal_key)
+        return t.terminal_password if t else None
 
     # ── удобные методы доступа ──────────────────────────────────────────────
 

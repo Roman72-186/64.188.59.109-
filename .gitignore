@@ -3,6 +3,9 @@
 config.yaml
 *.pem
 *.key
+*.crt
+*.p12
+*.pfx
 id_rsa*
 *_deploy
 *_deploy.pub

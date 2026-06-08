@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import secrets
 from contextlib import asynccontextmanager
 from typing import Any, Optional
@@ -16,6 +17,14 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .config import AppConfig, get_config
 from .database import Database
+from .dolyame import (
+    STATUS_COMMITTED,
+    STATUS_TERMINAL_NEGATIVE,
+    STATUS_WAIT_FOR_COMMIT,
+    DolyameClient,
+    build_item,
+    kopecks_to_rubles,
+)
 from .logging_setup import get_logger, setup_logging
 from .schemas import InitPaymentRequest, InitPaymentResponse, InitStatus
 from .shalamo import ShalamoClient
@@ -53,17 +62,38 @@ def create_app(
     db: Optional[Database] = None,
     tbank: Optional[TBankClient] = None,
     shalamo: Optional[ShalamoClient] = None,
+    dolyame: Optional[DolyameClient] = None,
 ) -> FastAPI:
     setup_logging()
     cfg = config or get_config()
     database = db or Database()
-    tbank_client = tbank or TBankClient(
-        terminal_key=cfg.tbank.terminal_key,
-        terminal_password=cfg.tbank.terminal_password,
-        api_url=cfg.tbank.api_url,
-        timeout_seconds=cfg.tbank.timeout_seconds,
-    )
     shalamo_client = shalamo or ShalamoClient(cfg.shalamo)
+
+    # Клиент прямого Долями: инъектированный (тесты) или из конфига, если блок задан.
+    dolyame_client = dolyame
+    if dolyame_client is None and cfg.dolyame is not None:
+        dolyame_client = DolyameClient(cfg.dolyame)
+
+    # Клиенты Т-Банка по terminal_key: основной + доп. магазины (напр. отдельный
+    # магазин под Долями, чтобы форма показывала только его). Способ оплаты ->
+    # терминал задаётся в config. Инъектированный клиент (тесты) используется как
+    # единственный для всех способов.
+    if tbank is not None:
+        def client_for_method(method: str) -> Any:
+            return tbank
+    else:
+        clients_by_terminal = {
+            t.terminal_key: TBankClient(
+                terminal_key=t.terminal_key,
+                terminal_password=t.terminal_password,
+                api_url=t.api_url,
+                timeout_seconds=t.timeout_seconds,
+            )
+            for t in cfg.resolved_terminals().values()
+        }
+
+        def client_for_method(method: str) -> Any:
+            return clients_by_terminal[cfg.terminal_key_for_method(method)]
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -113,6 +143,38 @@ def create_app(
             "❌ Доступ НЕ выдан order=%s — ТРЕБУЕТ РУЧНОГО РАЗБОРА", order["order_id"]
         )
         return False
+
+    # ── создание платежа через прямой Долями ─────────────────────────────────
+
+    async def init_dolyame_payment(
+        order_id: str, product: Any, req: InitPaymentRequest
+    ) -> JSONResponse:
+        """Создать заказ в прямом Partner API Долями и вернуть link как pay_url."""
+        items = [build_item(product.name, product.amount)]
+        client_info: dict[str, Any] = {}
+        if req.phone:
+            client_info["phone"] = req.phone
+        if req.email:
+            client_info["email"] = req.email
+        notification_url = cfg.server.public_url.rstrip("/") + "/webhook/dolyame"
+        res = await dolyame_client.create(
+            order_id=order_id,
+            amount_kopecks=product.amount,
+            items=items,
+            client_info=client_info or None,
+            notification_url=notification_url,
+        )
+        if res.success and res.link:
+            database.update_init_result(order_id, "", res.link)
+            log.info("init-payment: получена ссылка Долями order=%s", order_id)
+            return _resp(InitStatus.CREATED, 200, order_id=order_id, pay_url=res.link)
+
+        database.mark_failed(order_id, f"Долями create: {res.error_code} {res.message}")
+        log.error("init-payment: Долями не создал заказ order=%s", order_id)
+        return _resp(
+            InitStatus.PAYMENT_CREATION_FAILED, 502, order_id=order_id,
+            message=res.message,
+        )
 
     # ── /init-payment ────────────────────────────────────────────────────────
 
@@ -187,6 +249,11 @@ def create_app(
             "init-payment: создан платёж order=%s product=%s method=%s amount=%d",
             order_id, req.product_id, req.payment_method, product.amount,
         )
+
+        # 6a. прямой Долями — отдельный провайдер (не эквайринг Т-Банка)
+        if cfg.provider_for_method(req.payment_method) == "dolyame":
+            return await init_dolyame_payment(order_id, product, req)
+
         notification_url = cfg.server.public_url.rstrip("/") + "/webhook/tbank"
         receipt = cfg.build_receipt(req.product_id, email=req.email, phone=req.phone)
         if cfg.receipt and cfg.receipt.enabled and receipt is not None:
@@ -196,7 +263,7 @@ def create_app(
                     "Т-Банк отклонит Init (передай email/phone или задай fallback)",
                     order_id,
                 )
-        init = await tbank_client.init_payment(
+        init = await client_for_method(req.payment_method).init_payment(
             order_id=order_id,
             amount=product.amount,
             description=product.description,
@@ -228,8 +295,13 @@ def create_app(
             log.error("webhook: тело не разобралось как JSON")
             return PlainTextResponse("OK")
 
-        # 1. подпись
-        if not verify_webhook_token(payload, cfg.tbank.terminal_password):
+        # 1. подпись — пароль выбираем по TerminalKey (может быть доп. магазин)
+        terminal_key = str(payload.get("TerminalKey"))
+        password = cfg.password_for_terminal_key(terminal_key)
+        if password is None:
+            log.error("webhook: неизвестный TerminalKey=%s — не обрабатываем", terminal_key)
+            return PlainTextResponse("OK")
+        if not verify_webhook_token(payload, password):
             log.error("webhook: НЕВЕРНАЯ ПОДПИСЬ — не обрабатываем как оплату")
             return PlainTextResponse("OK")
 
@@ -269,7 +341,9 @@ def create_app(
                 "webhook: сумма webhook=%s != заказ=%s order=%s — проверяем GetState",
                 wh_amount, order["amount"], oid,
             )
-            state = await tbank_client.get_state(str(payment_id))
+            state = await client_for_method(order["payment_method"]).get_state(
+                str(payment_id)
+            )
             if not (
                 state.success
                 and state.status == "CONFIRMED"
@@ -307,6 +381,102 @@ def create_app(
         log.error("webhook: возвращаем 503 order=%s — Т-Банк повторит webhook", oid)
         return PlainTextResponse("Service Unavailable", status_code=503)
 
+    # ── /webhook/dolyame ───────────────────────────────────────────────────
+
+    @app.post("/webhook/dolyame")
+    async def webhook_dolyame(request: Request) -> PlainTextResponse:
+        if dolyame_client is None or cfg.dolyame is None:
+            log.error("webhook Долями: провайдер не сконфигурирован — игнорируем")
+            return PlainTextResponse("OK")
+
+        # 1. источник webhook — только подсеть Долями (за nginx: X-Forwarded-For)
+        client_ip = _client_ip(request)
+        if not _ip_in_subnet(client_ip, cfg.dolyame.webhook_allowed_subnet):
+            log.error("webhook Долями: запрещённый IP %s — игнорируем", client_ip)
+            return PlainTextResponse("Forbidden", status_code=403)
+
+        # 2. тело: интересует только id заказа — статус/сумму берём из /info
+        try:
+            payload = await request.json()
+        except Exception:
+            log.error("webhook Долями: тело не разобралось как JSON")
+            return PlainTextResponse("OK")
+        order_id = payload.get("id")
+        log.info(
+            "webhook Долями: order=%s status=%s (тело не доверяем, проверяем /info)",
+            order_id, payload.get("status"),
+        )
+
+        order = database.get_by_order_id(str(order_id)) if order_id else None
+        if order is None:
+            log.error("webhook Долями: заказ не найден order=%s", order_id)
+            return PlainTextResponse("OK")
+        oid = order["order_id"]
+
+        # 3. источник истины — GET /info (webhook Долями не подписан, как у Т-Банка)
+        info = await dolyame_client.info(oid)
+        if not info.success:
+            log.error("webhook Долями: /info недоступен order=%s — 503, повтор", oid)
+            return PlainTextResponse("Service Unavailable", status_code=503)
+        database.set_tbank_status(oid, str(info.status))
+
+        # 4. терминальный негатив — доступ не выдаём
+        if info.status in STATUS_TERMINAL_NEGATIVE:
+            database.mark_failed(oid, f"Долями статус {info.status}")
+            log.info("webhook Долями: статус %s order=%s — отказ", info.status, oid)
+            return PlainTextResponse("OK")
+
+        # 5. оплата ещё не произошла (new/approved) — ждём
+        if info.status not in STATUS_WAIT_FOR_COMMIT and info.status not in STATUS_COMMITTED:
+            log.info("webhook Долями: статус %s order=%s — доступ не выдаём", info.status, oid)
+            return PlainTextResponse("OK")
+
+        # 6. сверка суммы (рубли, точно через Decimal) — ДО commit, чтобы не
+        # захватывать холд с неверной суммой.
+        expected = kopecks_to_rubles(order["amount"])
+        if info.amount is not None and info.amount != expected:
+            log.error(
+                "webhook Долями: сумма info=%s != заказ=%s order=%s — доступ не выдаём",
+                info.amount, expected, oid,
+            )
+            return PlainTextResponse("OK")
+
+        # 7. двухфазность: на wait_for_commit захватываем холд (commit), затем доступ
+        product = cfg.get_product(order["product_id"])
+        item_name = product.name if product else order["product_id"]
+        if info.status in STATUS_WAIT_FOR_COMMIT and cfg.dolyame.commit_on_webhook:
+            items = [build_item(item_name, order["amount"])]
+            commit = await dolyame_client.commit(oid, order["amount"], items)
+            if not commit.success:
+                log.error("webhook Долями: commit не удался order=%s — 503", oid)
+                return PlainTextResponse("Service Unavailable", status_code=503)
+            log.info("webhook Долями: commit OK order=%s", oid)
+        # commit_on_webhook=False — выдаём доступ уже на холде (wait_for_commit)
+
+        # 8. идемпотентность: тег уже назначен
+        if order["tag_assigned_at"]:
+            log.info("webhook Долями: повторный — тег уже назначен order=%s", oid)
+            return PlainTextResponse("OK")
+
+        # фиксируем факт оплаты (после commit) — страхует PRD §7.3, даже если
+        # Долями не повторит webhook: следующий /init-payment до-назначит тег.
+        database.mark_paid(oid, str(info.status))
+
+        if not database.atomic_capture(oid):
+            fresh = database.get_by_order_id(oid)
+            if fresh and fresh["tag_assigned_at"]:
+                log.info("webhook Долями: параллельный — тег уже назначен order=%s", oid)
+            else:
+                log.info("webhook Долями: order=%s обрабатывается параллельно", oid)
+            return PlainTextResponse("OK")
+
+        # 8. назначение тега. 1 попытка: бюджет webhook уже съеден info+commit (mTLS).
+        ok = await grant_access(order, attempts=1)
+        if ok:
+            return PlainTextResponse("OK")
+        log.error("webhook Долями: тег не назначен order=%s — 503, повтор", oid)
+        return PlainTextResponse("Service Unavailable", status_code=503)
+
     # ── /health ──────────────────────────────────────────────────────────────
 
     @app.get("/health")
@@ -318,6 +488,28 @@ def create_app(
 
 # Запуск: uvicorn app.main:create_app --factory
 # (фабрика вызывается на старте; неверный config.yaml падает с понятной ошибкой).
+
+
+def _client_ip(request: Request) -> str:
+    """Реальный IP клиента за nginx. Берём X-Real-IP (nginx ставит $remote_addr —
+    клиент его подменить не может). Запасной вариант — ПОСЛЕДНИЙ хоп X-Forwarded-For
+    (nginx добавляет реальный адрес в конец через $proxy_add_x_forwarded_for; первый
+    элемент задаёт клиент и доверять ему нельзя). Иначе — peer соединения."""
+    real = request.headers.get("X-Real-IP")
+    if real:
+        return real.strip()
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[-1].strip()
+    return request.client.host if request.client else ""
+
+
+def _ip_in_subnet(ip: str, subnet: str) -> bool:
+    """Принадлежит ли IP подсети (CIDR). По множеству, не строковому префиксу."""
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(subnet, strict=False)
+    except ValueError:
+        return False
 
 
 def _resp(

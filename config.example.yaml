@@ -10,6 +10,16 @@ tbank:
   api_url: "https://securepay.tinkoff.ru/v2"   # боевой
   # тестовый: "https://rest-api-test.tinkoff.ru/v2"
   timeout_seconds: 15
+  # ── Доп. терминалы (отдельные магазины Т-Банка) под конкретные способы ЭКВАЙРИНГА.
+  # Нужны, когда форма должна показывать ТОЛЬКО один способ (напр. Рассрочка): в API
+  # это задаётся не запросом, а терминалом, где включён лишь нужный способ. Заведи
+  # отдельный магазин с одним способом, пропиши его ключи здесь и сошлись на имя
+  # из payment_methods[*].terminal. api_url/timeout наследуются от основного.
+  # (Для Долями это НЕ нужно — она ведётся отдельным провайдером, см. блок dolyame ниже.)
+  # extra_terminals:
+  #   installment_shop:
+  #     terminal_key: "CHANGE_ME"
+  #     terminal_password: "CHANGE_ME"
 
 server:
   host: "0.0.0.0"
@@ -74,6 +84,24 @@ receipt:
   email: ""                   # fallback-email для чека, если бот не передал (опц.)
   phone: ""                   # fallback-телефон (опц.)
 
+# ── Долями: прямой Partner API (mTLS + Basic) ───────────────────────────────
+# Отдельный ПРОВАЙДЕР оплаты, НЕ эквайринг Т-Банка. Нужен, когда требуется форма
+# «только Долями» (в эквайринге Т-Банка обязательные способы из формы не убрать).
+# Включается на способе оплаты через `provider: dolyame` (см. payment_methods ниже).
+# Поток: /init-payment -> POST /v1/orders/create -> link (pay_url) -> оплата 25%
+# -> webhook (статус wait_for_commit) -> прокладка зовёт commit -> тег в shalamov.io.
+# dolyame:
+#   base_url: "https://partner.dolyame.ru"
+#   login: "CHANGE_ME"
+#   password: "CHANGE_ME"
+#   # Клиентский сертификат mTLS из ЛК Т-Бизнеса — ОБЯЗАТЕЛЕН на каждый запрос.
+#   cert_path: ""              # путь к .crt/.pem (без него TLS-handshake не пройдёт)
+#   key_path: ""               # путь к .key
+#   timeout_seconds: 5
+#   fiscalization: "disabled"  # disabled | enabled (fiscalization_settings в API)
+#   commit_on_webhook: true    # на wait_for_commit синхронно делать commit, затем тег
+#   webhook_allowed_subnet: "91.194.226.0/23"  # webhook'и принимаем только отсюда
+
 # ── Способы оплаты: общие доп. параметры Init Т-Банка ───────────────────────
 payment_methods:
   card:
@@ -87,10 +115,13 @@ payment_methods:
     label: "Долями"
     extra_params:
       PayType: "O"
+    # provider: dolyame        # ⬅ прямой Partner API Долями (НЕ эквайринг Т-Банка);
+    #                            требует блока `dolyame:` ниже. Даёт Долями-only форму.
   installment:
     label: "Рассрочка"
     extra_params:
       PayType: "O"
+    # terminal: installment_shop  # вести через отдельный магазин (см. tbank.extra_terminals)
 
 # ── Товары. Ключ словаря = product_id, который передаёт бот ─────────────────
 products:
