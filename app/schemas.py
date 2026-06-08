@@ -27,6 +27,7 @@ class InitPaymentRequest(BaseModel):
     # идёт по секретному токену от доверенной платформы (shalamov.io/бот) — конечный
     # клиент его не видит и подменить сумму не может.
     amount: Optional[int] = Field(default=None, gt=0, description="сумма в копейках — переопределяет product.amount")
+    force: bool = Field(default=False, description="пропустить проверку активной ссылки и создать новый платёж")
     # Контакт для чека 54-ФЗ (опционально; иначе берётся fallback из config.receipt)
     email: Optional[str] = Field(default=None, description="email покупателя для чека")
     phone: Optional[str] = Field(default=None, description="телефон покупателя для чека")

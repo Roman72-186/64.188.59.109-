@@ -259,16 +259,17 @@ def create_app(
             )
             return _resp(status, 200, order_id=paid["order_id"], pay_url=paid["pay_url"])
 
-        # 5. активная неоплаченная ссылка (PRD §7.2)
-        active = database.find_active_link(
-            req.contact_id, req.product_id, req.payment_method
-        )
-        if active is not None:
-            log.info("init-payment: возврат активной ссылки order=%s", active["order_id"])
-            return _resp(
-                InitStatus.EXISTING_ACTIVE, 200,
-                order_id=active["order_id"], pay_url=active["pay_url"],
+        # 5. активная неоплаченная ссылка (PRD §7.2) — пропускаем при force=True
+        if not req.force:
+            active = database.find_active_link(
+                req.contact_id, req.product_id, req.payment_method
             )
+            if active is not None:
+                log.info("init-payment: возврат активной ссылки order=%s", active["order_id"])
+                return _resp(
+                    InitStatus.EXISTING_ACTIVE, 200,
+                    order_id=active["order_id"], pay_url=active["pay_url"],
+                )
 
         # 6. создание нового платежа
         # Сумма: платформа (shalamov.io/бот) может передать своё значение в копейках —
