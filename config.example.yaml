@@ -119,7 +119,10 @@ receipt:
 #   api_password: "CHANGE_ME"      # пароль API (Магазины -> Настройки API в ЛК)
 #   promo_code: "default"          # PromoCode продукта (рассрочка/кредит); опц.,
 #                                   # string(64), по умолчанию "default" (если в ЛК
-#                                   # подключён один продукт — оставить как есть)
+#                                   # подключён один продукт — оставить как есть).
+#                                   # Если в ЛК несколько продуктов (напр. рассрочка
+#                                   # на разные сроки) — переопределить per-способ
+#                                   # полем promo_code в payment_methods (см. ниже).
 #   api_url: "https://forma.tbank.ru/api/partners/v2"   # боевой
 #   # тестовый: "https://forma.tinkoff.ru/api/partners/v2"
 #   timeout_seconds: 15
@@ -153,6 +156,16 @@ payment_methods:
   # credit:
   #   label: "Кредит/рассрочка"
   #   provider: tbank_credit      # ⬅ Credit Broker (forma.tbank.ru); требует блока tbank_credit
+  # Несколько продуктов Credit Broker под один товар (напр. рассрочка на разные
+  # сроки) — отдельный способ оплаты на каждый промокод из ЛК:
+  # installment_3:
+  #   label: "Рассрочка на 3 месяца"
+  #   provider: tbank_credit
+  #   promo_code: "installment_..._3_..."   # код продукта "3 месяца" из ЛК
+  # installment_6:
+  #   label: "Рассрочка на 6 месяцев"
+  #   provider: tbank_credit
+  #   promo_code: "installment_..._6_..."   # код продукта "6 месяцев" из ЛК
 
 # ── Товары. Ключ словаря = product_id, который передаёт бот ─────────────────
 products:

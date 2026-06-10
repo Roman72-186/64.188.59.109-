@@ -160,6 +160,10 @@ class PaymentMethodConfig(BaseModel):
     terminal: str | None = None
     # Провайдер оплаты: "tbank" (эквайринг, по умолчанию) | "dolyame" | "tbank_credit".
     provider: str = "tbank"
+    # Переопределение promoCode Credit Broker для этого способа (напр. разные сроки
+    # рассрочки 3/6/10 мес — разные продукты в ЛК). Только для provider=tbank_credit.
+    # None = взять tbank_credit.promo_code.
+    promo_code: str | None = None
 
 
 class ReceiptConfig(BaseModel):
@@ -256,12 +260,25 @@ class AppConfig(BaseModel):
                     f"способ оплаты '{name}': provider='tbank_credit', но блок "
                     f"'tbank_credit' в конфиге отсутствует"
                 )
+            if mc.promo_code and mc.provider != "tbank_credit":
+                raise ValueError(
+                    f"способ оплаты '{name}': promo_code задан, но provider != "
+                    f"'tbank_credit'"
+                )
         return self
 
     def provider_for_method(self, method: str) -> str:
         """Провайдер оплаты: 'tbank' | 'dolyame' | 'tbank_credit'."""
         mc = self.payment_methods.get(method)
         return mc.provider if mc else "tbank"
+
+    def promo_code_for_method(self, method: str) -> str | None:
+        """PromoCode Credit Broker для способа: переопределение на способе
+        (напр. срок рассрочки 3/6/10 мес) или tbank_credit.promo_code по умолчанию."""
+        mc = self.payment_methods.get(method)
+        if mc and mc.promo_code:
+            return mc.promo_code
+        return self.tbank_credit.promo_code if self.tbank_credit else None
 
     def credit_method_for(self, product_id: str) -> str | None:
         """Первый способ с provider='tbank_credit' у товара, или None."""

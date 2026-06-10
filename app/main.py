@@ -223,7 +223,7 @@ def create_app(
     # ── создание платежа через Credit Broker ─────────────────────────────────
 
     async def init_credit_payment(
-        order_id: str, product: Any, amount: int, req: InitPaymentRequest
+        order_id: str, product: Any, amount: int, req: InitPaymentRequest, method: str
     ) -> JSONResponse:
         """Создать заявку на кредит/рассрочку через T-Bank Credit Broker."""
         if credit_client is None:
@@ -244,6 +244,7 @@ def create_app(
             items=items,
             customer_info=customer_info or None,
             webhook_url=notification_url,
+            promo_code=cfg.promo_code_for_method(method),
         )
         if res.success and res.link:
             app_id = res.application_id or ""
@@ -359,7 +360,7 @@ def create_app(
 
         # 6б. Credit Broker — кредит/рассрочка
         if cfg.provider_for_method(effective_method) == "tbank_credit":
-            return await init_credit_payment(order_id, product, amount, req)
+            return await init_credit_payment(order_id, product, amount, req, effective_method)
 
         notification_url = cfg.server.public_url.rstrip("/") + "/webhook/tbank"
         receipt = cfg.build_receipt(

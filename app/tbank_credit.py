@@ -137,18 +137,20 @@ class TBankCreditClient:
         items: list[dict[str, Any]],
         customer_info: Optional[dict[str, Any]] = None,
         webhook_url: Optional[str] = None,
+        promo_code: Optional[str] = None,
     ) -> CreditResult:
         """POST /orders/create — создать заявку на кредит/рассрочку.
 
         Без Basic Auth: shopId + showcaseId идут в теле. orderNumber = наш order_id,
-        передаётся в webhook и нужен для Commit/Cancel/Info."""
+        передаётся в webhook и нужен для Commit/Cancel/Info. promo_code переопределяет
+        config.promo_code (напр. разные сроки рассрочки — разные продукты в ЛК)."""
         body: dict[str, Any] = {
             "shopId": self.config.shop_id,
             "showcaseId": self.config.showcase_id,
             "sum": float(kopecks_to_rubles(amount_kopecks)),
             "items": items,
             "orderNumber": order_id,
-            "promoCode": self.config.promo_code,
+            "promoCode": promo_code or self.config.promo_code,
         }
         if webhook_url:
             body["webhookURL"] = webhook_url

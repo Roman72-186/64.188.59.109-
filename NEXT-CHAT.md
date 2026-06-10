@@ -231,6 +231,28 @@ origin/main, потерь нет). Также обнаружено: сервер
   (+ автофоллоу), как для Долями.
 - После первого реального заказа уточнить `webhook_allowed_subnet` для
   Credit Broker (сейчас пусто — без IP-фильтра).
-- Если в ЛК подключено НЕСКОЛЬКО кредитных продуктов (напр. отдельно рассрочка
-  3/6/12 мес) — `promo_code: default` может оказаться не тем продуктом; тогда
-  нужен конкретный код продукта из ЛК вместо `"default"`.
+
+**10.06.2026 — ТРИ ПРОМОКОДА РАССРОЧКИ (3/6/10 мес), НЕ ЗАДЕПЛОЕНО.**
+Владелец прислал реальные коды продуктов из ЛК (POS-кредитование → промокоды):
+`installment_0_0_3_3,4_1,7` (3 мес), `installment_0_0_6_5,8_3` (6 мес),
+`installment_0_0_10_8,9_4,6` (10 мес). Реализовано переопределение `promoCode` Credit
+Broker per-способ оплаты:
+- `app/config.py` — новое поле `PaymentMethodConfig.promo_code: str | None`
+  (только для `provider: tbank_credit`, иначе ошибка валидации) + метод
+  `AppConfig.promo_code_for_method()` (override способа, иначе `tbank_credit.promo_code`).
+- `app/tbank_credit.py` — `TBankCreditClient.create(..., promo_code=...)` переопределяет
+  `config.promo_code`.
+- `app/main.py` — `init_credit_payment` передаёт `cfg.promo_code_for_method(method)`.
+- `config.yaml` — старый единственный способ `installment` (provider: tbank_credit,
+  promo_code: default) заменён на три: `installment_3` / `installment_6` / `installment_10`,
+  каждый со своим `promo_code`. Все три ведут на те же теги `paid_installment_basic` /
+  `fail_installment_basic` (доступ не зависит от срока рассрочки).
+- `config.example.yaml` — задокументирован per-способ `promo_code` + пример
+  `installment_3`/`installment_6`.
+- Тесты: +3 (85 всего) — дефолтный promo_code, override per-способ, валидация
+  (promo_code без provider=tbank_credit → ошибка конфига).
+**Нужно для деплоя:** задеплоить код + новый `config.yaml` (git push/pull,
+`systemctl restart`), затем теги `paid_installment_basic`/`fail_installment_basic`
+(см. пункт выше — общий долг). После деплоя бот должен слать `payment_method`
+= `installment_3` | `installment_6` | `installment_10` (старое имя `installment`
+больше не существует в конфиге).

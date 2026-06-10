@@ -99,6 +99,19 @@ venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск;
   укладываться в таймаут webhook Т-Банка (~10с).
 - **Тег — «гейт» доступа:** успех = тег назначен (запускает авторассылку). Переменные
   шлются перед тегом best-effort; их сбой не блокирует доступ (пишется в лог).
+- **Чек 54-ФЗ — только передаётся в Init, не реализуется прокладкой**
+  (`ReceiptConfig`/`AppConfig.build_receipt` в [app/config.py](app/config.py)): боевой
+  терминал с онлайн-кассой требует объект `Receipt` в каждом Init, иначе ошибка
+  `309 {request.validate.expected.receipt}`; без блока `receipt`/`enabled: false`
+  Receipt не шлётся (тестовый терминал). Чек = одна позиция (товар); сумма берётся
+  из `amount` запроса (не `product.amount` — иначе разойдётся с Init). Email/Phone
+  получателя обязательны по 54-ФЗ — из `/init-payment` либо fallback `receipt.email/phone`.
+- **Тег отказа (`fail_tags_by_method`)** — отдельный опциональный факт в БД
+  (`fail_tag_assigned_at`, `capture_fail_tag`/`mark_fail_tag_assigned` в
+  [app/database.py](app/database.py)): при терминальном негативном статусе у Долями
+  или Credit Broker (rejected/canceled) прокладка best-effort назначает тег отказа
+  (триггер авторассылки «оплата не прошла») — не гейт доступа. Если для способа тег
+  не задан в `tags_by_method`/`fail_tags_by_method`, ничего не шлётся (старое поведение).
 - **Логи** — `logs/app.log` + stdout; секреты маскируются (`logging_setup.mask_secrets`).
 
 ## Деплой / доступ

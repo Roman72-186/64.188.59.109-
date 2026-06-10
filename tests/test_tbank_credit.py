@@ -86,8 +86,8 @@ class FakeCredit:
         self.info_calls: list[str] = []
         self.commit_calls: list[str] = []
 
-    async def create(self, order_id, amount_kopecks, items, customer_info=None, webhook_url=None) -> CreditResult:
-        self.create_calls.append({"order_id": order_id, "amount_kopecks": amount_kopecks})
+    async def create(self, order_id, amount_kopecks, items, customer_info=None, webhook_url=None, promo_code=None) -> CreditResult:
+        self.create_calls.append({"order_id": order_id, "amount_kopecks": amount_kopecks, "promo_code": promo_code})
         if self.create_succeeds:
             return CreditResult(
                 success=True,
@@ -150,6 +150,51 @@ def test_credit_init_fails_when_create_fails(tmp_path):
     )
     assert r.status_code == 502
     assert r.json()["status"] == "payment_creation_failed"
+
+
+def test_credit_init_uses_default_promo_code(tmp_path):
+    """Способ без promo_code -> promoCode берётся из tbank_credit.promo_code."""
+    env = _make_env(make_config(), tmp_path)
+    env.client.post(
+        "/init-payment",
+        json={"contact_id": "c1", "product_id": "course_basic",
+              "payment_method": "credit", "amount": 5000000},
+        headers={"X-Secret-Token": SECRET_TOKEN},
+    )
+    assert env.credit.create_calls[0]["promo_code"] == "promo1"
+
+
+def test_credit_init_uses_method_promo_code_override(tmp_path):
+    """Способ с promo_code -> переопределяет tbank_credit.promo_code (напр.
+    разные сроки рассрочки = разные продукты в ЛК)."""
+    cfg = make_config()
+    raw = cfg.model_dump()
+    raw["payment_methods"]["installment_3"] = {
+        "label": "Рассрочка на 3 месяца",
+        "provider": "tbank_credit",
+        "promo_code": "installment_0_0_3_3,4_1,7",
+    }
+    raw["products"]["course_basic"]["payment_methods"].append("installment_3")
+    raw["products"]["course_basic"]["tags_by_method"]["installment_3"] = "paid_installment_basic"
+    cfg = AppConfig.model_validate(raw)
+
+    env = _make_env(cfg, tmp_path)
+    env.client.post(
+        "/init-payment",
+        json={"contact_id": "c1", "product_id": "course_basic",
+              "payment_method": "installment_3", "amount": 5000000},
+        headers={"X-Secret-Token": SECRET_TOKEN},
+    )
+    assert env.credit.create_calls[0]["promo_code"] == "installment_0_0_3_3,4_1,7"
+
+
+def test_promo_code_requires_tbank_credit_provider(tmp_path):
+    """promo_code на способе с provider != tbank_credit -> ошибка конфига."""
+    cfg = make_config()
+    raw = cfg.model_dump()
+    raw["payment_methods"]["card"]["promo_code"] = "should_not_be_here"
+    with pytest.raises(ValueError):
+        AppConfig.model_validate(raw)
 
 
 # ── авто-апгрейд по порогу ────────────────────────────────────────────────────
