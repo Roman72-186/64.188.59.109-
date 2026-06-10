@@ -187,3 +187,41 @@ shalamov.io). Commit `ee3f60b`, `config.yaml` правлен (`fail_tags_by_meth
 
 **Открытые вопросы:** позитив `commit → тег` (нужен платёж с прошедшим скорингом BNPL);
 тег отказа — ждём первого реального `rejected`/`canceled` в логах. Детали — в «Уточнениях».
+
+**09.06.2026 — T-BANK CREDIT BROKER (кредит/рассрочка > 30 000 ₽) — КОД ГОТОВ, НЕ ЗАДЕПЛОЕН.**
+Новый провайдер `provider: tbank_credit` + 82 теста (было 67). Авто-апгрейд:
+`credit_threshold_kopecks: 3000000` → если `amount >= 30 000 ₽` и у товара есть credit-метод —
+прокладка автоматически переключается на Credit Broker. Новые файлы/изменения:
+`app/tbank_credit.py`, `app/config.py` (TBankCreditConfig, credit_threshold_kopecks),
+`app/main.py` (init_credit_payment + /webhook/tbank_credit), `config.example.yaml`.
+**Нужно для деплоя:**
+1. В ЛК Т-Бизнеса (бизнес.тбанк.ру → POS-кредитование) получить: ShopId, ShowcaseId, PromoCode,
+   API-пароль (Магазины → Настройки API). Тестовый API: `https://forma.tinkoff.ru/api/partners/v2`.
+2. Добавить в `config.yaml` блок `tbank_credit` + `credit_threshold_kopecks: 3000000`.
+3. Добавить способ `credit` в `payment_methods` (provider: tbank_credit) и в `products.*`
+   (payment_methods, tags_by_method, опц. fail_tags_by_method).
+4. Развернуть на сервер (`git push` + `git pull` + `pip install` + `systemctl restart`).
+5. Сначала протестировать на demo-ключах: `showcaseId = "demo-<твой_showcase>"`, URL = tinkoff.ru.
+
+**10.06.2026 — КОНФИГ ЗАПОЛНЕН (промокод = "default"), ВСЁ ЕЩЁ НЕ ЗАДЕПЛОЕНО.**
+`config.yaml` уже содержит блок `tbank_credit` (shop_id/showcase_id/api_password —
+боевые значения от пользователя), способ `installment` переведён на
+`provider: tbank_credit` (настроен ТАК ЖЕ как Долями — отдельная форма/webhook,
+не через эквайринг), добавлен в `products.course_basic` (tags_by_method:
+`paid_installment_basic`, fail_tags_by_method: `fail_installment_basic`).
+`promo_code` по документации — `string(64), optional`, по умолчанию `"default"`
+(используется единственный/основной кредитный продукт магазина) → выставлен
+`promo_code: default`, `TBankCreditConfig.promo_code` в `app/config.py` теперь
+имеет default `"default"`. `credit_threshold_kopecks` НЕ задан — авто-апгрейда по
+сумме нет, `installment` доступен только как явный выбор способа оплаты. 82 теста
+зелёные локально.
+**Осталось:**
+- Создать в shalamov.io теги `paid_installment_basic` / `fail_installment_basic`
+  (+ автофоллоу), как для Долями.
+- Деплой: `git push` + на сервере `git pull` + `systemctl restart tbank-proxy`,
+  проверить 82 теста на сервере.
+- После первого реального заказа уточнить `webhook_allowed_subnet` для
+  Credit Broker (сейчас пусто — без IP-фильтра).
+- Если в ЛК подключено НЕСКОЛЬКО кредитных продуктов (напр. отдельно рассрочка
+  3/6/12 мес) — `promo_code: default` может оказаться не тем продуктом; тогда
+  нужен конкретный код продукта из ЛК вместо `"default"`.

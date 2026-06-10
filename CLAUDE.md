@@ -16,15 +16,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **[PRD.md](PRD.md)** — источник истины по требованиям; **[DOCS.md](DOCS.md)** —
 установка/настройка/эксплуатация (синхронизирован с кодом).
 
-**Мультипровайдер:** карта/СБП/рассрочка — через эквайринг Т-Банка; **Долями — через
-прямой Partner API Долями** (`provider: dolyame`). Провайдер выбирается на способе оплаты
-в `config.yaml`.
+**Мультипровайдер (`payment_methods[*].provider` в config.yaml):**
+- `tbank` (по умолчанию) — карта/СБП/рассрочка через эквайринг Т-Банка;
+- `dolyame` — Долями через прямой Partner API Долями (mTLS+Basic, своя форма);
+- `tbank_credit` — кредит/рассрочка через T-Bank Credit Broker (forma.tbank.ru, Basic).
 
 Поток (Т-Банк): бот → `POST /init-payment` → Т-Банк выдаёт `pay_url` → пользователь платит →
 `POST /webhook/tbank` → синхронно назначается тег в shalamov.io → авторассылка по тегу.
 Поток (Долями): `/init-payment` → `create` → `pay_url` → оплата → `POST /webhook/dolyame`
-→ `commit` → тег. Тег **только назначается** прокладкой; удаляется первым шагом
-авторассылки внутри shalamov.io.
+→ `commit` → тег.
+Поток (Credit Broker): `/init-payment` → `create` → `pay_url` (форма forma.tbank.ru) →
+клиент подписывает документы (`signed`) → `POST /webhook/tbank_credit` → (опц. `commit`) → тег.
+Авто-апгрейд: если `amount >= credit_threshold_kopecks` и у товара есть `tbank_credit`-метод,
+прокладка сама переключает способ оплаты на кредитный (см. `AppConfig.credit_method_for`).
+Тег **только назначается** прокладкой; удаляется первым шагом авторассылки внутри shalamov.io.
 
 ## Команды
 
@@ -33,7 +38,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 venv\Scripts\pip install -r requirements.txt        # Windows
 cp config.example.yaml config.yaml                  # заполнить ключи + secret_token
 
-venv\Scripts\python -m pytest -q                    # 62 теста: unit + интеграционные
+venv\Scripts\python -m pytest -q                    # 82 теста: unit + интеграционные
 venv\Scripts\python test_flow.py                    # автономный прогон потока на моках
 venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск; GET /health -> {"status":"ok"}
 ```
@@ -69,6 +74,20 @@ venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск;
   подписано → источник истины `GET /info`; доверенность отправителя — по **IP-allowlist**
   (`webhook_allowed_subnet`, реальный IP из `X-Real-IP` от nginx). Та же модель идемпотентности
   и 503-повтора, что у Т-Банка. `provider: dolyame` требует блок `dolyame` в конфиге.
+- **T-Bank Credit Broker — отдельный провайдер** ([app/tbank_credit.py](app/tbank_credit.py)):
+  способ с `provider: tbank_credit` идёт через `forma.tbank.ru/api/partners/v2/orders`
+  (НЕ эквайринг). `Create` — без авторизации (shopId+showcaseId+promoCode в теле, из ЛК
+  business.tbank.ru/posloans); `Commit`/`Cancel`/`Info` — Basic (`showcase_id:api_password`).
+  Суммы — в рублях (Decimal). Статусы заявки: `new → inprogress → approved → signed →
+  canceled|rejected`. На `signed`: если `commit_on_webhook: true` — прокладка зовёт `Commit`
+  (ручное подтверждение, обязателен в течение 14 дней), иначе тег ставится сразу (авто-
+  подтверждение настраивается в ЛК). Свой webhook **`POST /webhook/tbank_credit`**: тело не
+  подписано → источник истины `GET /info`; IP-allowlist через `webhook_allowed_subnet`
+  (пусто = без проверки). `provider: tbank_credit` требует блок `tbank_credit` в конфиге.
+  **Авто-апгрейд по сумме:** `AppConfig.credit_threshold_kopecks` — если `amount` запроса
+  `/init-payment` ≥ порога и у товара есть метод с `provider: tbank_credit`, прокладка сама
+  подменяет `payment_method` на кредитный (`credit_method_for`), независимо от того, что
+  запросил бот.
 - **Два независимых факта в БД** ([app/database.py](app/database.py)): `paid_at`
   (банк подтвердил) и `tag_assigned_at` (доступ выдан). На этом стоит вся логика
   «оплачено, но тег не назначен» (PRD §7.3) и идемпотентность.

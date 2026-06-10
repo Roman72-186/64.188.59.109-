@@ -96,6 +96,33 @@ class ShalamoConfig(BaseModel):
     set_variables: ShalamoEndpoint | None = None
 
 
+class TBankCreditConfig(BaseModel):
+    """T-Bank Credit Broker API (forma.tbank.ru) — кредит/рассрочка для покупателей.
+
+    Включается через `provider: tbank_credit` в payment_methods.
+    Параметры shopId/showcaseId/promoCode берутся из ЛК Т-Бизнеса (раздел POS-кредитование).
+    Порог для авто-переключения задаётся в AppConfig.credit_threshold_kopecks.
+    """
+
+    shop_id: str
+    showcase_id: str
+    api_password: str
+    # Идентификатор кредитного продукта (рассрочка/кредит) из ЛК. Опционально —
+    # API сам подставляет "default", если не передать.
+    promo_code: str = "default"
+    api_url: str = "https://forma.tbank.ru/api/partners/v2"
+    timeout_seconds: float = 15.0
+    # False = авто-подтверждение включено в ЛК Т-Банка (тег выдаём сразу на signed).
+    # True = ручной Commit через API (вызывается в webhook), затем тег.
+    commit_on_webhook: bool = False
+    # Подсеть (CIDR), с которой принимаем webhook. Пусто = от всех (не рекомендуется).
+    webhook_allowed_subnet: str = ""
+    # URL редиректов после оплаты (опционально; если пусто — не передаются в Create).
+    success_url: str = ""
+    fail_url: str = ""
+    return_url: str = ""
+
+
 class DolyameConfig(BaseModel):
     """Прямой Partner API Долями (partner.dolyame.ru): mTLS + Basic.
 
@@ -131,7 +158,7 @@ class PaymentMethodConfig(BaseModel):
     extra_params: dict[str, Any] = Field(default_factory=dict)
     # Имя терминала из tbank.extra_terminals. None = основной терминал.
     terminal: str | None = None
-    # Провайдер оплаты: "tbank" (эквайринг, по умолчанию) | "dolyame" (прямой Partner API).
+    # Провайдер оплаты: "tbank" (эквайринг, по умолчанию) | "dolyame" | "tbank_credit".
     provider: str = "tbank"
 
 
@@ -190,6 +217,12 @@ class AppConfig(BaseModel):
     receipt: ReceiptConfig | None = None
     # Прямой Partner API Долями. Если не задан — способы с provider='dolyame' запрещены.
     dolyame: DolyameConfig | None = None
+    # T-Bank Credit Broker. Если не задан — способы с provider='tbank_credit' запрещены.
+    tbank_credit: TBankCreditConfig | None = None
+    # Порог в копейках для авто-апгрейда до кредита. None = отключено.
+    # Если amount >= порога и у товара есть метод с provider='tbank_credit' —
+    # запрошенный способ оплаты автоматически заменяется кредитным.
+    credit_threshold_kopecks: int | None = None
 
     @model_validator(mode="after")
     def _cross_checks(self) -> "AppConfig":
@@ -208,23 +241,38 @@ class AppConfig(BaseModel):
                     f"способ оплаты '{name}': терминал '{mc.terminal}' "
                     f"отсутствует в tbank.extra_terminals"
                 )
-            if mc.provider not in ("tbank", "dolyame"):
+            if mc.provider not in ("tbank", "dolyame", "tbank_credit"):
                 raise ValueError(
                     f"способ оплаты '{name}': неизвестный provider '{mc.provider}' "
-                    f"(допустимо: tbank | dolyame)"
+                    f"(допустимо: tbank | dolyame | tbank_credit)"
                 )
-            # Прямой Долями требует блока dolyame в конфиге.
             if mc.provider == "dolyame" and self.dolyame is None:
                 raise ValueError(
                     f"способ оплаты '{name}': provider='dolyame', но блок 'dolyame' "
                     f"в конфиге отсутствует"
                 )
+            if mc.provider == "tbank_credit" and self.tbank_credit is None:
+                raise ValueError(
+                    f"способ оплаты '{name}': provider='tbank_credit', но блок "
+                    f"'tbank_credit' в конфиге отсутствует"
+                )
         return self
 
     def provider_for_method(self, method: str) -> str:
-        """Провайдер оплаты способа: 'tbank' (эквайринг) | 'dolyame' (прямой API)."""
+        """Провайдер оплаты: 'tbank' | 'dolyame' | 'tbank_credit'."""
         mc = self.payment_methods.get(method)
         return mc.provider if mc else "tbank"
+
+    def credit_method_for(self, product_id: str) -> str | None:
+        """Первый способ с provider='tbank_credit' у товара, или None."""
+        product = self.products.get(product_id)
+        if not product:
+            return None
+        for method in product.payment_methods:
+            mc = self.payment_methods.get(method)
+            if mc and mc.provider == "tbank_credit":
+                return method
+        return None
 
     # ── терминалы (основной + доп. магазины) ────────────────────────────────
 

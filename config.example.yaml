@@ -102,6 +102,34 @@ receipt:
 #   commit_on_webhook: true    # на wait_for_commit синхронно делать commit, затем тег
 #   webhook_allowed_subnet: "91.194.226.0/23"  # webhook'и принимаем только отсюда
 
+# ── T-Bank Credit Broker (forma.tbank.ru) — кредит/рассрочка ────────────────
+# Отдельный провайдер для крупных сумм. Включается через `provider: tbank_credit`
+# в payment_methods. Покупателю предлагается оформить кредит или рассрочку.
+# Параметры shopId/showcaseId/promoCode — из ЛК Т-Бизнеса (раздел POS-кредитование).
+#
+# Авто-апгрейд (credit_threshold_kopecks): если amount >= порога и у товара есть
+# tbank_credit-метод — прокладка автоматически переключается на кредит, даже если
+# бот запросил другой способ оплаты. 3 000 000 копеек = 30 000 рублей.
+#
+# credit_threshold_kopecks: 3000000
+#
+# tbank_credit:
+#   shop_id: "CHANGE_ME"           # ShopId из ЛК (код организации)
+#   showcase_id: "CHANGE_ME"       # ShowcaseId (код веб-ресурса)
+#   api_password: "CHANGE_ME"      # пароль API (Магазины -> Настройки API в ЛК)
+#   promo_code: "default"          # PromoCode продукта (рассрочка/кредит); опц.,
+#                                   # string(64), по умолчанию "default" (если в ЛК
+#                                   # подключён один продукт — оставить как есть)
+#   api_url: "https://forma.tbank.ru/api/partners/v2"   # боевой
+#   # тестовый: "https://forma.tinkoff.ru/api/partners/v2"
+#   timeout_seconds: 15
+#   commit_on_webhook: false        # false = авто-подтверждение в ЛК (рекомендуется);
+#                                   # true = ручной Commit через API (14 дней после signed)
+#   webhook_allowed_subnet: ""      # CIDR подсети Credit Broker; пусто = принимать от всех
+#   success_url: ""                 # URL перехода после успешной заявки (опц.)
+#   fail_url: ""
+#   return_url: ""
+
 # ── Способы оплаты: общие доп. параметры Init Т-Банка ───────────────────────
 payment_methods:
   card:
@@ -122,6 +150,9 @@ payment_methods:
     extra_params:
       PayType: "O"
     # terminal: installment_shop  # вести через отдельный магазин (см. tbank.extra_terminals)
+  # credit:
+  #   label: "Кредит/рассрочка"
+  #   provider: tbank_credit      # ⬅ Credit Broker (forma.tbank.ru); требует блока tbank_credit
 
 # ── Товары. Ключ словаря = product_id, который передаёт бот ─────────────────
 products:

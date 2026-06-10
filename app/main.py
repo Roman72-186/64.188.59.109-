@@ -25,6 +25,12 @@ from .dolyame import (
     build_item,
     kopecks_to_rubles,
 )
+from .tbank_credit import (
+    STATUS_SIGNED as CREDIT_STATUS_SIGNED,
+    STATUS_TERMINAL_NEGATIVE as CREDIT_STATUS_NEGATIVE,
+    TBankCreditClient,
+    build_credit_item,
+)
 from .logging_setup import get_logger, setup_logging
 from .schemas import InitPaymentRequest, InitPaymentResponse, InitStatus
 from .shalamo import ShalamoClient
@@ -63,6 +69,7 @@ def create_app(
     tbank: Optional[TBankClient] = None,
     shalamo: Optional[ShalamoClient] = None,
     dolyame: Optional[DolyameClient] = None,
+    tbank_credit: Optional[TBankCreditClient] = None,
 ) -> FastAPI:
     setup_logging()
     cfg = config or get_config()
@@ -73,6 +80,11 @@ def create_app(
     dolyame_client = dolyame
     if dolyame_client is None and cfg.dolyame is not None:
         dolyame_client = DolyameClient(cfg.dolyame)
+
+    # Credit Broker: инъектированный (тесты) или из конфига, если блок задан.
+    credit_client = tbank_credit
+    if credit_client is None and cfg.tbank_credit is not None:
+        credit_client = TBankCreditClient(cfg.tbank_credit)
 
     # Клиенты Т-Банка по terminal_key: основной + доп. магазины (напр. отдельный
     # магазин под Долями, чтобы форма показывала только его). Способ оплаты ->
@@ -208,6 +220,44 @@ def create_app(
             message=res.message,
         )
 
+    # ── создание платежа через Credit Broker ─────────────────────────────────
+
+    async def init_credit_payment(
+        order_id: str, product: Any, amount: int, req: InitPaymentRequest
+    ) -> JSONResponse:
+        """Создать заявку на кредит/рассрочку через T-Bank Credit Broker."""
+        if credit_client is None:
+            log.error("init-payment: Credit Broker не сконфигурирован order=%s", order_id)
+            database.mark_failed(order_id, "Credit Broker не сконфигурирован")
+            return _resp(InitStatus.PAYMENT_CREATION_FAILED, 502, order_id=order_id)
+
+        items = [build_credit_item(product.name, amount)]
+        customer_info: dict[str, Any] = {}
+        if req.phone:
+            customer_info["phone"] = req.phone
+        if req.email:
+            customer_info["email"] = req.email
+        notification_url = cfg.server.public_url.rstrip("/") + "/webhook/tbank_credit"
+        res = await credit_client.create(
+            order_id=order_id,
+            amount_kopecks=amount,
+            items=items,
+            customer_info=customer_info or None,
+            webhook_url=notification_url,
+        )
+        if res.success and res.link:
+            app_id = res.application_id or ""
+            database.update_init_result(order_id, app_id, res.link)
+            log.info("init-payment: получена ссылка Credit Broker order=%s", order_id)
+            return _resp(InitStatus.CREATED, 200, order_id=order_id, pay_url=res.link)
+
+        database.mark_failed(order_id, f"Credit Broker create: {res.error_code} {res.message}")
+        log.error("init-payment: Credit Broker не создал заявку order=%s", order_id)
+        return _resp(
+            InitStatus.PAYMENT_CREATION_FAILED, 502, order_id=order_id,
+            message=res.message,
+        )
+
     # ── /init-payment ────────────────────────────────────────────────────────
 
     @app.post("/init-payment", response_model=InitPaymentResponse)
@@ -236,6 +286,26 @@ def create_app(
             )
             return _resp(InitStatus.INVALID_PAYMENT_METHOD, 400)
 
+        # 3б. авто-апгрейд до кредита при превышении порога:
+        #   если amount >= credit_threshold_kopecks И у товара есть tbank_credit-метод
+        #   И запрошенный метод — НЕ tbank_credit (чтобы не зациклиться),
+        #   то переключаем на кредитный способ оплаты.
+        amount = req.amount
+        effective_method = req.payment_method
+        if (
+            cfg.credit_threshold_kopecks is not None
+            and amount >= cfg.credit_threshold_kopecks
+            and cfg.provider_for_method(req.payment_method) != "tbank_credit"
+        ):
+            credit_method = cfg.credit_method_for(req.product_id)
+            if credit_method:
+                log.info(
+                    "init-payment: сумма %d >= %d — апгрейд до кредита, метод %s->%s",
+                    amount, cfg.credit_threshold_kopecks,
+                    req.payment_method, credit_method,
+                )
+                effective_method = credit_method
+
         # 4. товар уже оплачен (PRD §7.3)
         paid = database.find_paid_order(req.contact_id, req.product_id)
         if paid is not None:
@@ -262,7 +332,7 @@ def create_app(
         # 5. активная неоплаченная ссылка (PRD §7.2) — пропускаем при force=True
         if not req.force:
             active = database.find_active_link(
-                req.contact_id, req.product_id, req.payment_method
+                req.contact_id, req.product_id, effective_method
             )
             if active is not None:
                 log.info("init-payment: возврат активной ссылки order=%s", active["order_id"])
@@ -272,21 +342,24 @@ def create_app(
                 )
 
         # 6. создание нового платежа
-        amount = req.amount  # сумма всегда от платформы (обязательное поле)
         order_id = f"{req.product_id}_{req.contact_id}_{secrets.token_hex(4)}"
-        tag = cfg.tag_for(req.product_id, req.payment_method)
+        tag = cfg.tag_for(req.product_id, effective_method)
         database.create_payment(
-            order_id, req.contact_id, req.product_id, req.payment_method,
+            order_id, req.contact_id, req.product_id, effective_method,
             amount, tag,
         )
         log.info(
             "init-payment: создан платёж order=%s product=%s method=%s amount=%d",
-            order_id, req.product_id, req.payment_method, amount,
+            order_id, req.product_id, effective_method, amount,
         )
 
         # 6a. прямой Долями — отдельный провайдер (не эквайринг Т-Банка)
-        if cfg.provider_for_method(req.payment_method) == "dolyame":
+        if cfg.provider_for_method(effective_method) == "dolyame":
             return await init_dolyame_payment(order_id, product, amount, req)
+
+        # 6б. Credit Broker — кредит/рассрочка
+        if cfg.provider_for_method(effective_method) == "tbank_credit":
+            return await init_credit_payment(order_id, product, amount, req)
 
         notification_url = cfg.server.public_url.rstrip("/") + "/webhook/tbank"
         receipt = cfg.build_receipt(
@@ -517,6 +590,115 @@ def create_app(
         if ok:
             return PlainTextResponse("OK")
         log.error("webhook Долями: тег не назначен order=%s — 503, повтор", oid)
+        return PlainTextResponse("Service Unavailable", status_code=503)
+
+    # ── /webhook/tbank_credit ─────────────────────────────────────────────────
+
+    @app.post("/webhook/tbank_credit")
+    async def webhook_tbank_credit(request: Request) -> PlainTextResponse:
+        if credit_client is None or cfg.tbank_credit is None:
+            log.error("webhook Credit Broker: провайдер не сконфигурирован — игнорируем")
+            return PlainTextResponse("OK")
+
+        # 1. IP-allowlist (опционально; если подсеть не задана — пропускаем проверку)
+        if cfg.tbank_credit.webhook_allowed_subnet:
+            client_ip = _client_ip(request)
+            if not _ip_in_subnet(client_ip, cfg.tbank_credit.webhook_allowed_subnet):
+                log.error(
+                    "webhook Credit Broker: запрещённый IP %s — игнорируем", client_ip
+                )
+                return PlainTextResponse("Forbidden", status_code=403)
+        else:
+            log.debug("webhook Credit Broker: webhook_allowed_subnet не задан, IP не проверяем")
+
+        # 2. тело — берём orderNumber (наш order_id) и application_id
+        try:
+            payload = await request.json()
+        except Exception:
+            log.error("webhook Credit Broker: тело не разобралось как JSON")
+            return PlainTextResponse("OK")
+
+        order_id = payload.get("orderNumber")
+        application_id = payload.get("id")
+        log.info(
+            "webhook Credit Broker: order=%s app_id=%s status=%s (проверяем /info)",
+            order_id, application_id, payload.get("status"),
+        )
+
+        # Попытка найти заказ: сначала по orderNumber, затем по application_id (tbank_payment_id)
+        order = None
+        if order_id:
+            order = database.get_by_order_id(str(order_id))
+        if order is None and application_id:
+            order = database.get_by_tbank_payment_id(str(application_id))
+        if order is None:
+            log.error(
+                "webhook Credit Broker: заказ не найден order=%s app_id=%s",
+                order_id, application_id,
+            )
+            return PlainTextResponse("OK")
+        oid = order["order_id"]
+
+        # 3. источник истины — GET /info (webhook не подписан)
+        info = await credit_client.info(oid)
+        if not info.success:
+            log.error("webhook Credit Broker: /info недоступен order=%s — 503, повтор", oid)
+            return PlainTextResponse("Service Unavailable", status_code=503)
+        database.set_tbank_status(oid, str(info.status))
+
+        # 4. терминальный негатив — доступ не выдаём; назначаем тег отказа (если задан)
+        if info.status in CREDIT_STATUS_NEGATIVE:
+            database.mark_failed(oid, f"Credit Broker статус {info.status}")
+            log.info(
+                "webhook Credit Broker: статус %s order=%s — отказ", info.status, oid
+            )
+            fail_tag = cfg.fail_tag_for(order["product_id"], order["payment_method"])
+            if fail_tag and database.capture_fail_tag(oid):
+                await assign_failure_tag(order, fail_tag, attempts=WEBHOOK_TAG_ATTEMPTS)
+            return PlainTextResponse("OK")
+
+        # 5. заявка не подписана — ждём
+        if info.status not in CREDIT_STATUS_SIGNED:
+            log.info(
+                "webhook Credit Broker: статус %s order=%s — доступ не выдаём",
+                info.status, oid,
+            )
+            return PlainTextResponse("OK")
+
+        # 6. signed — при ручном режиме вызываем Commit, затем выдаём доступ
+        if cfg.tbank_credit.commit_on_webhook:
+            commit = await credit_client.commit(oid)
+            if not commit.success:
+                log.error("webhook Credit Broker: commit не удался order=%s — 503", oid)
+                return PlainTextResponse("Service Unavailable", status_code=503)
+            log.info("webhook Credit Broker: commit OK order=%s", oid)
+
+        # 7. идемпотентность: тег уже назначен
+        if order["tag_assigned_at"]:
+            log.info(
+                "webhook Credit Broker: повторный — тег уже назначен order=%s", oid
+            )
+            return PlainTextResponse("OK")
+
+        database.mark_paid(oid, str(info.status))
+
+        if not database.atomic_capture(oid):
+            fresh = database.get_by_order_id(oid)
+            if fresh and fresh["tag_assigned_at"]:
+                log.info(
+                    "webhook Credit Broker: параллельный — тег уже назначен order=%s", oid
+                )
+            else:
+                log.info(
+                    "webhook Credit Broker: order=%s обрабатывается параллельно", oid
+                )
+            return PlainTextResponse("OK")
+
+        # 8. назначение тега (1 попытка: бюджет webhook съеден info+commit)
+        ok = await grant_access(order, attempts=1)
+        if ok:
+            return PlainTextResponse("OK")
+        log.error("webhook Credit Broker: тег не назначен order=%s — 503, повтор", oid)
         return PlainTextResponse("Service Unavailable", status_code=503)
 
     # ── /health ──────────────────────────────────────────────────────────────
