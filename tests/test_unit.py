@@ -73,3 +73,28 @@ def test_find_paid_order_requires_paid_at():
     assert db.find_paid_order("c1", "course_basic") is None
     db.mark_paid("o1")
     assert db.find_paid_order("c1", "course_basic") is not None
+
+
+def test_get_pending_credit_orders_filters():
+    db = _db()
+    db.create_payment("o1", "c1", "course_basic", "credit", 5000000, "paid_credit_basic")
+    db.create_payment("o2", "c2", "course_basic", "credit", 5000000, "paid_credit_basic")
+    db.create_payment("o3", "c3", "course_basic", "credit", 5000000, "paid_credit_basic")
+    db.create_payment("o4", "c4", "course_basic", "card", 9900, "paid_card_basic")
+
+    # o2 — тег уже назначен, o3 — назначен тег отказа: оба не должны опрашиваться
+    db.mark_paid("o2")
+    db.atomic_capture("o2")
+    db.mark_tag_assigned("o2")
+    db.capture_fail_tag("o3")
+    db.mark_fail_tag_assigned("o3")
+
+    pending = db.get_pending_credit_orders(["credit"], max_age_seconds=3600)
+    ids = {o["order_id"] for o in pending}
+    assert ids == {"o1"}  # o2/o3 завершены, o4 — другой способ оплаты
+
+    # max_age=0 -> только что созданные заявки уже "устарели"
+    assert db.get_pending_credit_orders(["credit"], max_age_seconds=0) == []
+
+    # неизвестный способ оплаты -> ничего
+    assert db.get_pending_credit_orders(["installment_3"], max_age_seconds=3600) == []

@@ -139,6 +139,30 @@ class Database:
             )
             return self._row(cur.fetchone())
 
+    def get_pending_credit_orders(
+        self, payment_methods: list[str], max_age_seconds: int
+    ) -> list[dict[str, Any]]:
+        """Заявки Credit Broker (provider=tbank_credit) без финального исхода —
+        для фонового опроса GET /info (см. модуль tbank_credit). Условие то же,
+        что у идемпотентного захвата: ни тег успеха, ни тег отказа ещё не
+        назначены. `max_age_seconds` отсекает давно заброшенные заявки."""
+        if not payment_methods:
+            return []
+        threshold = (
+            datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+        ).isoformat()
+        placeholders = ",".join("?" for _ in payment_methods)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"SELECT * FROM payments "
+                f"WHERE payment_method IN ({placeholders}) "
+                f"  AND tag_assigned_at IS NULL AND fail_tag_assigned_at IS NULL "
+                f"  AND created_at >= ? "
+                f"ORDER BY created_at ASC",
+                (*payment_methods, threshold),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
     def find_paid_order(
         self, contact_id: str, product_id: str
     ) -> Optional[dict[str, Any]]:

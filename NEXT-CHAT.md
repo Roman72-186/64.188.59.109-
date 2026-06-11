@@ -9,91 +9,65 @@
 ## Промт
 
 ```
-Контекст: интеграция Долями (Dolyame Partner API) в прокладку Т-Банк ↔ shalamov.io.
-Каркас Долями УЖЕ написан и протестирован, связь с боевым API подтверждена.
-Задача нового чата — ДЕПЛОЙ на сервер и АКТИВАЦИЯ боевого приёма Долями.
+Контекст: T-Bank Credit Broker (рассрочка installment_3/6/10) интегрирован и был
+задеплоен (commits ec2ea92, f5e7bf6, 85/85 тестов), но реальный /init-payment падал:
+
+  "validations":{"webhookURL":"...домен... должен совпадать с доменом вашего сайта"}
+
+Расследование (см. «Уточнения» 10-11.06.2026 ниже) установило: точка Credit Broker
+зарегистрирована на домен клиента novoseltsevyayest.ru (НЕ домен прокладки
+pay.sushi-house-39.ru); вкладка «Интеграция» в ЛК НЕ имеет полей под webhook вообще;
+поле «HTTP-уведомления о статусе заявки» принимает только apex-домен сайта,
+поддомены (pay.novoseltsevyayest.ru) ОТКЛОНЯЕТ. DNS/поддомен — тупиковый путь.
+
+РЕШЕНИЕ (реализовано локально 11.06.2026, 90/90 тестов зелёные, НЕ ЗАДЕПЛОЕНО):
+webhookURL вообще убран из Create. Подтверждено реальным curl на forma.tbank.ru
+(пользователь прогнал сам) — Create БЕЗ webhookURL прошёл, вернул заявку
+{"id":"e18e65aa-647a-4c7c-9c0c-04b6c351c008","link":"https://forma.tbank.ru/online/sso/..."}
+(тестовая заявка, не подписана клиентом, безобидна, истечёт сама — не трогать).
+
+Источник истины как и раньше — GET /info (Basic auth, без ограничений по домену).
+Вместо webhook — общая функция process_credit_status() в app/main.py, вызывается:
+  1) из /webhook/tbank_credit (если у БУДУЩЕГО клиента домен совпадёт — сработает);
+  2) из НОВОГО фонового поллера _poll_credit_orders() — основной канал теперь.
+
+Новое в конфиге: tbank_credit.poll_interval_seconds (число секунд, 0 = выключено,
+дефолт). database.get_pending_credit_orders() выбирает заявки без tag_assigned_at/
+fail_tag_assigned_at, отсечка CREDIT_POLL_MAX_AGE_SECONDS = 30 дней (app/main.py).
+
+ЗАДАЧА НОВОГО ЧАТА: задеплоить и проверить реальный installment_3 e2e.
 
 ПРОЕКТ
-Рабочая папка открыта (git, ветка main). Прокладка Python 3.10+ / FastAPI / SQLite
-между платежами и shalamov.io. Поток Т-Банка: бот → POST /init-payment → Т-Банк Init
-→ pay_url → оплата → POST /webhook/tbank → синхронно тег в shalamov.io → авторассылка.
-Сначала прочитай CLAUDE.md, DOCS.md, app/dolyame.py, app/main.py, app/config.py,
-deploy/ssh-access.md. Всё поведение — через config.yaml; код под проект не правится.
-Суммы товаров в config — В КОПЕЙКАХ. venv на CPython 3.12.
-Тесты: venv\Scripts\python -m pytest -q  (должно быть 58 passed).
+Рабочая папка открыта (git, ветка main). Прокладка Python 3.10+ / FastAPI / SQLite.
+Сначала прочитай: CLAUDE.md (раздел Credit Broker уже обновлён под новую схему),
+app/tbank_credit.py (docstring), app/main.py (process_credit_status,
+_poll_credit_orders, lifespan, init_credit_payment), app/config.py
+(TBankCreditConfig.poll_interval_seconds, credit_broker_methods),
+app/database.py (get_pending_credit_orders), deploy/ssh-access.md.
+venv на CPython 3.12. Тесты: venv\Scripts\python -m pytest -q (90 passed).
 
-ЧТО УЖЕ СДЕЛАНО (готово и протестировано локально)
-- app/dolyame.py — httpx-клиент прямого Долями: mTLS (cert=(crt,key)) + Basic +
-  X-Correlation-ID (uuid4); методы create/info/commit/cancel/refund; retry на 429 по
-  X-Retry-After; конвертация копейки↔рубли через Decimal; единый разбор ошибок.
-- app/config.py — модель DolyameConfig + поле provider ('tbank'|'dolyame') на способе
-  оплаты + кросс-проверка (provider=dolyame требует блок dolyame). Метод
-  provider_for_method().
-- app/main.py — DI dolyame-клиента в create_app; ветка в /init-payment (provider=dolyame
-  → dolyame.create() → отдаём link); НОВЫЙ эндпоинт POST /webhook/dolyame:
-  • IP-allowlist 91.194.226.0/23 (по X-Real-IP, через ipaddress; nginx форвардит);
-  • источник истины — GET /info (webhook Долями НЕ подписан, как у Т-Банка);
-  • сверка суммы ДО commit (Decimal); двухфазность: на wait_for_commit → commit →
-    переиспользуем mark_paid + atomic_capture + grant_access (тег как гейт);
-  • commit идемпотентен: на повторном webhook статус уже committed → commit не зовётся.
-- config.example.yaml — задокументирован блок dolyame + provider.
-- tests/test_dolyame.py — 14 тестов на моках (роутинг, двухфазность, commit ровно один
-  раз на дубль и на 503-retry, IP allow/deny, сверка суммы, отказ, commit_on_webhook=false,
-  юниты конвертации). Всего в проекте 58 passed.
+ШАГИ ДЕПЛОЯ
+1. Запушить коммит с этими изменениями (если ещё не запушен), задеплоить на
+   64.188.59.109 (plink/pscp — см. deploy/ssh-access.md и память про деплой:
+   маскированные diff'ы config.yaml, бэкап перед заменой, git reset --hard
+   только с подтверждением владельца).
+2. В СЕРВЕРНЫЙ config.yaml добавить tbank_credit.poll_interval_seconds (рекомендация
+   60-120 сек) — в локальном репо его нет (0/не задан), это ОЖИДАЕМОЕ расхождение
+   при структурном diff'е, добавить вручную.
+3. Прогнать pytest на сервере (90 passed), перезапустить tbank-proxy.service,
+   проверить /health.
+4. Тестовый /init-payment с payment_method=installment_3, amount >= 310800 копеек
+   (минимум 3108₽ для installment_3 — см. находку 11.06.2026), force: true.
+   Ожидаем pay_url БЕЗ ошибки webhookURL (это и есть критерий успеха).
+5. Подождать ~poll_interval после изменения статуса заявки (signed/rejected),
+   проверить логи (`poll Credit Broker: ...`) и таблицу payments — tag_assigned_at
+   / fail_tag_assigned_at должны проставиться так же, как раньше через webhook.
 
-ПРИНЯТЫЕ РЕШЕНИЯ (дефолты; владелец подтвердил «боевой»)
-1. Тег вешаем ПОСЛЕ commit: webhook wait_for_commit → синхронно commit (=реальный захват
-   денег) → committed → тег. Флаг dolyame.commit_on_webhook=true (можно выключить —
-   тогда тег на холде без захвата).
-2. Фискализация: dolyame.fiscalization=disabled (чек НЕ шлём). НЕ подтверждено на живом
-   заказе — боевой BNPL по 54-ФЗ может потребовать чек → create может отклонить. Проверить
-   на первой оплате; если потребует — включить fiscalization + добавить параметры в адаптер.
-3. end_cooling_period (период охлаждения) — НЕ учитываем (возвраты вне scope). Проброшен
-   в DolyameResult на будущее.
-
-СЕРТИФИКАТ И КРЕДЫ (боевые)
-- Боевые Basic-креды в config.yaml: login 06fd70b5-59e1-4656-8133-b525b43929b3 (пароль
-  тоже там). Тестовые креды (Test-7ffc27ce…) лежат закомментированными.
-- mTLS-сертификат ПОЛУЧЕН и лежит в корне проекта (gitignored: *.pem, *.key):
-  2-certificate-2026-06-08-bnpl.pem + 2-private1.key. RSA2048, выдан TBank_Sub1, до
-  2026-06-08…2027-06-08, ключ совпадает с сертификатом. Пути прописаны в config.yaml
-  (cert_path/key_path). ВНИМАНИЕ: пароль/креды были в переписке — ротировать после интеграции.
-
-СВЯЗЬ С БОЕВЫМ API ПОДТВЕРЖДЕНА (08.06.2026, с сервера 64.188.59.109)
-- GET /v1/orders/<fake>/info с боевыми кредами+сертификатом вернул 404 «Заказ не найден».
-- Значит: mTLS принят, Basic ок (не 401), IP сервера НЕ заблокирован (не 403, whitelist
-  не мешает). Egress IP сервера = 64.188.59.109.
-
-СЕРВЕР (деплой)
-- VPS 64.188.59.109, root, Ubuntu 22.04, Python 3.10.12. Доступ — deploy/ssh-access.md
-  (на Windows работает ТОЛЬКО plink/pscp из PuTTY; OpenSSH падает на KEX). Пароль и host
-  key — в .env (SSH_PASSWORD, SSH_HOSTKEY_SHA256). DEPLOY_PATH=/opt/tbank_proxy.
-- На сервере СЕЙЧАС сборка от 3 июня — БЕЗ app/dolyame.py и без сегодняшних правок
-  (main.py/config.py/config.example.yaml). Серверный config.yaml тоже старый (без боевых
-  креды Долями и без cert_path/key_path). Сертификата на сервере нет (после теста /tmp
-  очищен). systemd-сервис tbank-proxy.service, nginx+HTTPS (pay.sushi-house-39.ru),
-  nginx форвардит X-Real-IP/X-Forwarded-For на location / (вкл. /webhook/dolyame).
-
-ЗАДАЧА НОВОГО ЧАТА — ДЕПЛОЙ + АКТИВАЦИЯ (по шагам, с подтверждением владельца перед прод-деньгами)
-1. Выкатить сегодняшний код на сервер (git push + pull на сервере, либо pscp изменённых
-   файлов: app/dolyame.py, app/main.py, app/config.py, config.example.yaml,
-   tests/test_dolyame.py). Прогнать pytest на сервере (58 passed).
-2. Положить сертификат+ключ в ПОСТОЯННОЕ безопасное место на сервере (НЕ /tmp; напр.
-   /opt/tbank_proxy/ с правами 600, владелец сервиса www-data). Прописать боевые креды
-   Долями + cert_path/key_path в СЕРВЕРНЫЙ config.yaml (синхронизировать с локальным).
-3. Включить маршрут: provider: dolyame на способе dolyami в payment_methods (СЕЙЧАС
-   ВЫКЛЮЧЕН — dolyami всё ещё идёт через эквайринг Т-Банка). Перезапустить сервис.
-4. Первая БОЕВАЯ оплата на минимальную сумму (1–2 ₽ — завести временный дешёвый товар
-   или временно снизить amount): проверить сквозной поток create → link → оплата →
-   webhook wait_for_commit → commit → тег в shalamov.io. На этом шаге проявятся два
-   непроверенных момента: чек/фискализация (реш. №2) и реальный IP webhook'а Долями
-   (ожидаем из 91.194.226.0/23 — если придёт с другого IP, наш allowlist его отклонит,
-   тогда подправить webhook_allowed_subnet в config.yaml).
-5. Обновить DOCS.md (синхронизировать с кодом: новый провайдер, /webhook/dolyame, ключи
-   конфига dolyame, требование nginx X-Real-IP) — сейчас DOCS.md по Долями устарел.
-
-ВАЖНО ПРО ДЕНЬГИ: commit на webhook = реальное списание у клиента. Возвраты вне scope.
-Первый прогон — строго на минимальной сумме и под наблюдением.
+ОСТАВШИЕСЯ TODO (из предыдущих хэндоффов, ниже не нумерую заново):
+- Создать в shalamov.io теги paid_installment_basic / fail_installment_basic
+  + автоворонки.
+- webhook_allowed_subnet для tbank_credit (сейчас пусто) — менее критично теперь,
+  основной канал статусов — поллинг, не входящий webhook.
 ```
 
 ---
@@ -251,8 +225,49 @@ Broker per-способ оплаты:
   `installment_3`/`installment_6`.
 - Тесты: +3 (85 всего) — дефолтный promo_code, override per-способ, валидация
   (promo_code без provider=tbank_credit → ошибка конфига).
-**Нужно для деплоя:** задеплоить код + новый `config.yaml` (git push/pull,
-`systemctl restart`), затем теги `paid_installment_basic`/`fail_installment_basic`
-(см. пункт выше — общий долг). После деплоя бот должен слать `payment_method`
-= `installment_3` | `installment_6` | `installment_10` (старое имя `installment`
-больше не существует в конфиге).
+**10.06.2026 — ЗАДЕПЛОЕНО.** Коммит `f5e7bf6` запушен и развёрнут (git pull
+fast-forward `ec2ea92..f5e7bf6`, 85/85 тестов на сервере, новый `config.yaml`
+залит, бэкап `config.yaml.bak-20260610-installment-promo`, сервис перезапущен,
+`/health` → ok). Бот должен слать `payment_method` = `installment_3` |
+`installment_6` | `installment_10` (старое имя `installment` больше не
+существует в конфиге).
+
+**10.06.2026 — БЛОКЕР: Credit Broker отклоняет webhookURL по домену.**
+Тестовый запрос `/init-payment` с `payment_method: installment_3` вернул
+`payment_creation_failed`:
+```
+"validations":{"webhookURL":"Для ссылки возврата некорректно указан домен,
+он должен совпадать с доменом вашего сайта"}
+```
+Прокладка шлёт `webhookURL = https://pay.sushi-house-39.ru/webhook/tbank_credit`
+(`cfg.server.public_url + "/webhook/tbank_credit"`, `app/main.py:240`). Это
+блокер на стороне ЛК, не код.
+
+**Уточнение от поддержки Т-Банка:** динамический `webhookURL` (домен, отличный
+от основного сайта) в теле `Create` — штатный способ (это и делает прокладка).
+
+**11.06.2026 — испробовано и НЕ помогло:** пользователь заполнил в ЛК
+(раздел «Т-Рассрочки» → «HTTP-уведомления о статусе заявки» → «Ссылка для
+HTTP-нотификации (webhook URL)», ранее было пустое поле, для Долями там стоит
+`https://dolyame.ru/white-list/`) значением
+`https://pay.sushi-house-39.ru/webhook/tbank_credit`. Повторный тест —
+**та же ошибка** `webhookURL: домен должен совпадать с доменом вашего сайта`.
+Значит это поле — НЕ то, с которым сверяется домен `webhookURL` из Create.
+«Домен сайта» настраивается где-то ещё (вероятно реквизиты магазина/ShopId
+`4bd5a1e9-c05d-42bd-9c9e-ebbb266a67b2` — вкладка «Магазины»/«Реквизиты»/
+«Основная информация» в ЛК), либо нужно повторно уточнить у поддержки точное
+расположение поля для ShowcaseId `1c9fa012-13e4-4e55-b83b-e7668bb9124b`.
+
+**11.06.2026 — доп. находка:** для `installment_3` (3 мес.) сумма заказа должна
+быть **от 3108 до 517598 руб.** (ошибка `errors: ["Сумма заказа должна быть не
+менее 3108 и не более 517598 руб. включительно"]` при сумме 99 руб). Это лимит
+продукта в ЛК, не баг прокладки — но важно для тестирования (использовать
+amount >= 310800 копеек) и для будущей логики (товар `course_basic` стоит 99 ₽
+— рассрочка для него физически невозможна, актуально для дорогих товаров).
+
+После исправления домена — повторить тестовый `/init-payment` с
+`installment_3/6/10`, amount >= 310800 (curl-пример был выслан пользователю
+в чате, добавить `"force": true` для повторных тестов с тем же contact_id).
+Опционально: `tbank_credit.success_url/fail_url/return_url` в `config.yaml`
+(сейчас пустые) — редиректы покупателя после успеха/отказа, уходят как
+`successURL`/`failURL`/`returnURL` в тело Create.

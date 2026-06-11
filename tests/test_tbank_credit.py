@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,7 @@ def make_config(
     commit_on_webhook: bool = False,
     webhook_allowed_subnet: str = "",
     credit_threshold_kopecks: int | None = None,
+    poll_interval_seconds: float = 0,
 ) -> AppConfig:
     raw = yaml.safe_load(open(EXAMPLE, encoding="utf-8"))
     raw["server"]["secret_token"] = SECRET_TOKEN
@@ -46,6 +48,7 @@ def make_config(
         "promo_code": "promo1",
         "commit_on_webhook": commit_on_webhook,
         "webhook_allowed_subnet": webhook_allowed_subnet,
+        "poll_interval_seconds": poll_interval_seconds,
     }
     raw["payment_methods"]["credit"] = {
         "label": "Кредит",
@@ -87,7 +90,10 @@ class FakeCredit:
         self.commit_calls: list[str] = []
 
     async def create(self, order_id, amount_kopecks, items, customer_info=None, webhook_url=None, promo_code=None) -> CreditResult:
-        self.create_calls.append({"order_id": order_id, "amount_kopecks": amount_kopecks, "promo_code": promo_code})
+        self.create_calls.append({
+            "order_id": order_id, "amount_kopecks": amount_kopecks,
+            "promo_code": promo_code, "webhook_url": webhook_url,
+        })
         if self.create_succeeds:
             return CreditResult(
                 success=True,
@@ -150,6 +156,21 @@ def test_credit_init_fails_when_create_fails(tmp_path):
     )
     assert r.status_code == 502
     assert r.json()["status"] == "payment_creation_failed"
+
+
+def test_credit_init_does_not_send_webhook_url(tmp_path):
+    """Create вызывается БЕЗ webhookURL: Т-Банк отклоняет Create, если домен
+    webhookURL не совпадает с доменом витрины клиента (не доменом прокладки).
+    Статус заявки получаем через GET /info — webhook (если домен совпадёт)
+    и/или фоновый опрос (poll_interval_seconds)."""
+    env = _make_env(make_config(), tmp_path)
+    env.client.post(
+        "/init-payment",
+        json={"contact_id": "c1", "product_id": "course_basic",
+              "payment_method": "credit", "amount": 5000000},
+        headers={"X-Secret-Token": SECRET_TOKEN},
+    )
+    assert env.credit.create_calls[0]["webhook_url"] is None
 
 
 def test_credit_init_uses_default_promo_code(tmp_path):
@@ -417,3 +438,65 @@ def test_reprocess_after_503(tmp_path):
     assert r2.status_code == 200
     assert len(env.shalamo.tag_calls) == 2  # 1 неудача + 1 успех
     assert env.db.get_by_order_id(order_id)["tag_assigned_at"] is not None
+
+
+# ── фоновый опрос /info (poll_interval_seconds) ───────────────────────────────
+
+def test_poll_assigns_tag_without_webhook(tmp_path):
+    """poll_interval_seconds > 0 -> фоновая задача сама опрашивает /info и
+    назначает тег без входящего /webhook/tbank_credit."""
+    env = _make_env(make_config(poll_interval_seconds=0.02), tmp_path)
+    order_id = _create_credit_order(env)
+    env.credit.info_status = "signed"
+
+    with env.client:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            order = env.db.get_by_order_id(order_id)
+            if order["tag_assigned_at"]:
+                break
+            time.sleep(0.02)
+
+    order = env.db.get_by_order_id(order_id)
+    assert order["tag_assigned_at"] is not None
+    assert order["paid_at"] is not None
+    assert len(env.shalamo.tag_calls) == 1
+
+
+def test_poll_assigns_fail_tag_for_rejected(tmp_path):
+    """Поллер применяет ту же логику тега отказа, что и webhook."""
+    cfg = make_config(poll_interval_seconds=0.02)
+    raw = cfg.model_dump()
+    raw["products"]["course_basic"]["fail_tags_by_method"]["credit"] = "fail_credit_basic"
+    cfg = AppConfig.model_validate(raw)
+
+    env = _make_env(cfg, tmp_path)
+    order_id = _create_credit_order(env)
+    env.credit.info_status = "rejected"
+
+    with env.client:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            order = env.db.get_by_order_id(order_id)
+            if order["fail_tag_assigned_at"]:
+                break
+            time.sleep(0.02)
+
+    order = env.db.get_by_order_id(order_id)
+    assert order["fail_tag_assigned_at"] is not None
+    assert order["status"] == "failed"
+
+
+def test_poll_disabled_by_default(tmp_path):
+    """poll_interval_seconds=0 (по умолчанию) -> фоновая задача не запускается,
+    статус заявки не меняется без входящего webhook."""
+    env = _make_env(make_config(poll_interval_seconds=0), tmp_path)
+    order_id = _create_credit_order(env)
+    env.credit.info_status = "signed"
+
+    with env.client:
+        time.sleep(0.1)
+
+    order = env.db.get_by_order_id(order_id)
+    assert order["tag_assigned_at"] is None
+    assert len(env.credit.info_calls) == 0

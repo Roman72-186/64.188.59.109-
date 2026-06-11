@@ -117,6 +117,11 @@ class TBankCreditConfig(BaseModel):
     commit_on_webhook: bool = False
     # Подсеть (CIDR), с которой принимаем webhook. Пусто = от всех (не рекомендуется).
     webhook_allowed_subnet: str = ""
+    # Период (сек) фонового опроса GET /info по незавершённым заявкам — нужен,
+    # когда webhookURL нельзя передать в Create (домен витрины не совпадает с
+    # доменом прокладки — Т-Банк отклоняет webhookURL по домену). 0 = опрос выключен
+    # (полагаемся только на /webhook/tbank_credit).
+    poll_interval_seconds: float = 0
     # URL редиректов после оплаты (опционально; если пусто — не передаются в Create).
     success_url: str = ""
     fail_url: str = ""
@@ -279,6 +284,13 @@ class AppConfig(BaseModel):
         if mc and mc.promo_code:
             return mc.promo_code
         return self.tbank_credit.promo_code if self.tbank_credit else None
+
+    def credit_broker_methods(self) -> list[str]:
+        """Все способы оплаты с provider='tbank_credit' (для опроса /info)."""
+        return [
+            name for name, mc in self.payment_methods.items()
+            if mc.provider == "tbank_credit"
+        ]
 
     def credit_method_for(self, product_id: str) -> str | None:
         """Первый способ с provider='tbank_credit' у товара, или None."""

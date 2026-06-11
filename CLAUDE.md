@@ -25,8 +25,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `POST /webhook/tbank` → синхронно назначается тег в shalamov.io → авторассылка по тегу.
 Поток (Долями): `/init-payment` → `create` → `pay_url` → оплата → `POST /webhook/dolyame`
 → `commit` → тег.
-Поток (Credit Broker): `/init-payment` → `create` → `pay_url` (форма forma.tbank.ru) →
-клиент подписывает документы (`signed`) → `POST /webhook/tbank_credit` → (опц. `commit`) → тег.
+Поток (Credit Broker): `/init-payment` → `create` (без `webhookURL`) → `pay_url` (форма
+forma.tbank.ru) → клиент подписывает документы (`signed`) → статус узнаём фоновым опросом
+`GET /info` (`tbank_credit.poll_interval_seconds`) и/или `POST /webhook/tbank_credit`
+(если домен совпадёт) → (опц. `commit`) → тег.
 Авто-апгрейд: если `amount >= credit_threshold_kopecks` и у товара есть `tbank_credit`-метод,
 прокладка сама переключает способ оплаты на кредитный (см. `AppConfig.credit_method_for`).
 Тег **только назначается** прокладкой; удаляется первым шагом авторассылки внутри shalamov.io.
@@ -38,7 +40,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 venv\Scripts\pip install -r requirements.txt        # Windows
 cp config.example.yaml config.yaml                  # заполнить ключи + secret_token
 
-venv\Scripts\python -m pytest -q                    # 82 теста: unit + интеграционные
+venv\Scripts\python -m pytest -q                    # 90 тестов: unit + интеграционные
 venv\Scripts\python test_flow.py                    # автономный прогон потока на моках
 venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск; GET /health -> {"status":"ok"}
 ```
@@ -81,13 +83,23 @@ venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск;
   Суммы — в рублях (Decimal). Статусы заявки: `new → inprogress → approved → signed →
   canceled|rejected`. На `signed`: если `commit_on_webhook: true` — прокладка зовёт `Commit`
   (ручное подтверждение, обязателен в течение 14 дней), иначе тег ставится сразу (авто-
-  подтверждение настраивается в ЛК). Свой webhook **`POST /webhook/tbank_credit`**: тело не
-  подписано → источник истины `GET /info`; IP-allowlist через `webhook_allowed_subnet`
-  (пусто = без проверки). `provider: tbank_credit` требует блок `tbank_credit` в конфиге.
-  **Авто-апгрейд по сумме:** `AppConfig.credit_threshold_kopecks` — если `amount` запроса
-  `/init-payment` ≥ порога и у товара есть метод с `provider: tbank_credit`, прокладка сама
-  подменяет `payment_method` на кредитный (`credit_method_for`), независимо от того, что
-  запросил бот.
+  подтверждение настраивается в ЛК). `provider: tbank_credit` требует блок `tbank_credit`
+  в конфиге. **Авто-апгрейд по сумме:** `AppConfig.credit_threshold_kopecks` — если `amount`
+  запроса `/init-payment` ≥ порога и у товара есть метод с `provider: tbank_credit`, прокладка
+  сама подменяет `payment_method` на кредитный (`credit_method_for`), независимо от того,
+  что запросил бот.
+  **`webhookURL` в `Create` НЕ передаётся**: Т-Банк отклоняет `Create`, если домен
+  webhookURL не совпадает с доменом витрины клиента (а у витрин разных клиентов он свой —
+  прокладка на это не влияет). Вместо webhook — **общая функция `process_credit_status`**
+  в [app/main.py](app/main.py) (источник истины всегда `GET /info`, тело webhook не
+  подписано), вызывается из двух мест:
+  - **`POST /webhook/tbank_credit`** — если у клиента домен витрины совпадёт с доменом
+    прокладки и webhook дойдёт; IP-allowlist через `webhook_allowed_subnet` (пусто = без
+    проверки);
+  - **фоновый поллер** (`tbank_credit.poll_interval_seconds`, 0 = выключен) — каждые N
+    секунд опрашивает `GET /info` по заявкам без `tag_assigned_at`/`fail_tag_assigned_at`
+    (`database.get_pending_credit_orders`, отсечка `CREDIT_POLL_MAX_AGE_SECONDS` = 30 дней) —
+    основной канал, не зависит от домена.
 - **Два независимых факта в БД** ([app/database.py](app/database.py)): `paid_at`
   (банк подтвердил) и `tag_assigned_at` (доступ выдан). На этом стоит вся логика
   «оплачено, но тег не назначен» (PRD §7.3) и идемпотентность.

@@ -46,6 +46,12 @@ RETRY_BACKOFF_SECONDS = 0.3
 # Терминальные негативные статусы Т-Банка — переводим платёж в failed.
 NEGATIVE_TBANK_STATUSES = {"REJECTED", "DEADLINE_EXPIRED", "CANCELED", "AUTH_FAIL"}
 
+# Фоновый опрос Credit Broker (tbank_credit.poll_interval_seconds): сколько попыток
+# назначения тега за один опрос и сколько максимум хранить заявку «в опросе»
+# (с запасом на 14-дневное окно Commit после signed).
+CREDIT_POLL_TAG_ATTEMPTS = 2
+CREDIT_POLL_MAX_AGE_SECONDS = 30 * 24 * 3600
+
 
 def _payment_variables(config: AppConfig, order: dict[str, Any]) -> dict[str, Any]:
     """Платёжные переменные контакта (PRD §7.7) + переменные товара."""
@@ -111,7 +117,27 @@ def create_app(
     async def lifespan(app: FastAPI):
         database.init_db()
         log.info("Прокладка запущена. Товаров: %d", len(cfg.products))
+
+        poll_task: Optional[asyncio.Task] = None
+        if (
+            credit_client is not None
+            and cfg.tbank_credit is not None
+            and cfg.tbank_credit.poll_interval_seconds > 0
+        ):
+            poll_task = asyncio.create_task(_poll_credit_orders())
+            log.info(
+                "Credit Broker: фоновый опрос /info каждые %.0fс",
+                cfg.tbank_credit.poll_interval_seconds,
+            )
+
         yield
+
+        if poll_task is not None:
+            poll_task.cancel()
+            try:
+                await poll_task
+            except asyncio.CancelledError:
+                pass
 
     app = FastAPI(title="TBank ↔ shalamov.io proxy", lifespan=lifespan)
 
@@ -237,13 +263,15 @@ def create_app(
             customer_info["phone"] = req.phone
         if req.email:
             customer_info["email"] = req.email
-        notification_url = cfg.server.public_url.rstrip("/") + "/webhook/tbank_credit"
+        # webhookURL не передаём: Т-Банк отклоняет Create, если домен webhookURL не
+        # совпадает с доменом витрины (а у витрин разных клиентов он свой). Статус
+        # заявки получаем через GET /info — по входящему /webhook/tbank_credit
+        # (если домен совпадёт) и/или фоновым опросом (tbank_credit.poll_interval_seconds).
         res = await credit_client.create(
             order_id=order_id,
             amount_kopecks=amount,
             items=items,
             customer_info=customer_info or None,
-            webhook_url=notification_url,
             promo_code=cfg.promo_code_for_method(method),
         )
         if res.success and res.link:
@@ -593,6 +621,106 @@ def create_app(
         log.error("webhook Долями: тег не назначен order=%s — 503, повтор", oid)
         return PlainTextResponse("Service Unavailable", status_code=503)
 
+    # ── Credit Broker: общая обработка статуса (webhook + фоновый опрос) ────────
+
+    async def process_credit_status(
+        order: dict[str, Any], attempts: int, source: str
+    ) -> bool:
+        """GET /info — источник истины (тело webhook не подписано, поэтому и
+        webhook, и фоновый поллер всегда перепроверяют статус здесь). Применяет
+        статус: терминальный негатив -> тег отказа; signed -> (опц. Commit) +
+        тег доступа (идемпотентно через atomic_capture).
+
+        True = обработано (включая «ждём», «уже обработано параллельно»).
+        False = transient-неудача (/info, Commit или назначение тега) — вызывающий
+        должен повторить позже (webhook -> 503, поллер -> следующий цикл)."""
+        oid = order["order_id"]
+
+        info = await credit_client.info(oid)
+        if not info.success:
+            log.error("%s Credit Broker: /info недоступен order=%s — повтор", source, oid)
+            return False
+        database.set_tbank_status(oid, str(info.status))
+
+        # терминальный негатив — доступ не выдаём; назначаем тег отказа (если задан)
+        if info.status in CREDIT_STATUS_NEGATIVE:
+            database.mark_failed(oid, f"Credit Broker статус {info.status}")
+            log.info(
+                "%s Credit Broker: статус %s order=%s — отказ", source, info.status, oid
+            )
+            fail_tag = cfg.fail_tag_for(order["product_id"], order["payment_method"])
+            if fail_tag and database.capture_fail_tag(oid):
+                await assign_failure_tag(order, fail_tag, attempts=WEBHOOK_TAG_ATTEMPTS)
+            return True
+
+        # заявка ещё не подписана — ждём
+        if info.status not in CREDIT_STATUS_SIGNED:
+            log.info(
+                "%s Credit Broker: статус %s order=%s — доступ не выдаём",
+                source, info.status, oid,
+            )
+            return True
+
+        # signed — при ручном режиме вызываем Commit, затем выдаём доступ
+        if cfg.tbank_credit.commit_on_webhook:
+            commit = await credit_client.commit(oid)
+            if not commit.success:
+                log.error("%s Credit Broker: commit не удался order=%s — повтор", source, oid)
+                return False
+            log.info("%s Credit Broker: commit OK order=%s", source, oid)
+
+        # идемпотентность: тег уже назначен
+        if order["tag_assigned_at"]:
+            log.info(
+                "%s Credit Broker: повторный — тег уже назначен order=%s", source, oid
+            )
+            return True
+
+        database.mark_paid(oid, str(info.status))
+
+        if not database.atomic_capture(oid):
+            fresh = database.get_by_order_id(oid)
+            if fresh and fresh["tag_assigned_at"]:
+                log.info(
+                    "%s Credit Broker: параллельный — тег уже назначен order=%s", source, oid
+                )
+            else:
+                log.info(
+                    "%s Credit Broker: order=%s обрабатывается параллельно", source, oid
+                )
+            return True
+
+        ok = await grant_access(order, attempts=attempts)
+        if ok:
+            return True
+        log.error("%s Credit Broker: тег не назначен order=%s — повтор", source, oid)
+        return False
+
+    async def _poll_credit_orders() -> None:
+        """Фоновая задача: периодически опрашивает GET /info по незавершённым
+        заявкам Credit Broker (см. process_credit_status). Нужна, когда webhookURL
+        нельзя передать в Create (домен витрины ≠ домен прокладки)."""
+        assert cfg.tbank_credit is not None
+        interval = cfg.tbank_credit.poll_interval_seconds
+        methods = cfg.credit_broker_methods()
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                orders = database.get_pending_credit_orders(methods, CREDIT_POLL_MAX_AGE_SECONDS)
+                for order in orders:
+                    try:
+                        await process_credit_status(
+                            order, attempts=CREDIT_POLL_TAG_ATTEMPTS, source="poll"
+                        )
+                    except Exception:
+                        log.exception(
+                            "poll Credit Broker: ошибка обработки order=%s", order["order_id"]
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("poll Credit Broker: ошибка цикла опроса")
+
     # ── /webhook/tbank_credit ─────────────────────────────────────────────────
 
     @app.post("/webhook/tbank_credit")
@@ -638,68 +766,12 @@ def create_app(
                 order_id, application_id,
             )
             return PlainTextResponse("OK")
-        oid = order["order_id"]
 
-        # 3. источник истины — GET /info (webhook не подписан)
-        info = await credit_client.info(oid)
-        if not info.success:
-            log.error("webhook Credit Broker: /info недоступен order=%s — 503, повтор", oid)
-            return PlainTextResponse("Service Unavailable", status_code=503)
-        database.set_tbank_status(oid, str(info.status))
-
-        # 4. терминальный негатив — доступ не выдаём; назначаем тег отказа (если задан)
-        if info.status in CREDIT_STATUS_NEGATIVE:
-            database.mark_failed(oid, f"Credit Broker статус {info.status}")
-            log.info(
-                "webhook Credit Broker: статус %s order=%s — отказ", info.status, oid
-            )
-            fail_tag = cfg.fail_tag_for(order["product_id"], order["payment_method"])
-            if fail_tag and database.capture_fail_tag(oid):
-                await assign_failure_tag(order, fail_tag, attempts=WEBHOOK_TAG_ATTEMPTS)
-            return PlainTextResponse("OK")
-
-        # 5. заявка не подписана — ждём
-        if info.status not in CREDIT_STATUS_SIGNED:
-            log.info(
-                "webhook Credit Broker: статус %s order=%s — доступ не выдаём",
-                info.status, oid,
-            )
-            return PlainTextResponse("OK")
-
-        # 6. signed — при ручном режиме вызываем Commit, затем выдаём доступ
-        if cfg.tbank_credit.commit_on_webhook:
-            commit = await credit_client.commit(oid)
-            if not commit.success:
-                log.error("webhook Credit Broker: commit не удался order=%s — 503", oid)
-                return PlainTextResponse("Service Unavailable", status_code=503)
-            log.info("webhook Credit Broker: commit OK order=%s", oid)
-
-        # 7. идемпотентность: тег уже назначен
-        if order["tag_assigned_at"]:
-            log.info(
-                "webhook Credit Broker: повторный — тег уже назначен order=%s", oid
-            )
-            return PlainTextResponse("OK")
-
-        database.mark_paid(oid, str(info.status))
-
-        if not database.atomic_capture(oid):
-            fresh = database.get_by_order_id(oid)
-            if fresh and fresh["tag_assigned_at"]:
-                log.info(
-                    "webhook Credit Broker: параллельный — тег уже назначен order=%s", oid
-                )
-            else:
-                log.info(
-                    "webhook Credit Broker: order=%s обрабатывается параллельно", oid
-                )
-            return PlainTextResponse("OK")
-
-        # 8. назначение тега (1 попытка: бюджет webhook съеден info+commit)
-        ok = await grant_access(order, attempts=1)
+        # 3. источник истины — GET /info (webhook не подписан); 1 попытка тега
+        # (бюджет webhook уже съеден info+commit)
+        ok = await process_credit_status(order, attempts=1, source="webhook")
         if ok:
             return PlainTextResponse("OK")
-        log.error("webhook Credit Broker: тег не назначен order=%s — 503, повтор", oid)
         return PlainTextResponse("Service Unavailable", status_code=503)
 
     # ── /health ──────────────────────────────────────────────────────────────
