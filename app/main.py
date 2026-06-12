@@ -220,7 +220,11 @@ def create_app(
         order_id: str, product: Any, amount: int, req: InitPaymentRequest
     ) -> JSONResponse:
         """Создать заказ в прямом Partner API Долями и вернуть link как pay_url."""
-        items = [build_item(product.name, amount)]
+        items = [
+            build_item(
+                product.name, amount, receipt=cfg.dolyame_item_receipt(req.product_id)
+            )
+        ]
         client_info: dict[str, Any] = {}
         if req.phone:
             client_info["phone"] = req.phone
@@ -589,7 +593,13 @@ def create_app(
         product = cfg.get_product(order["product_id"])
         item_name = product.name if product else order["product_id"]
         if info.status in STATUS_WAIT_FOR_COMMIT and cfg.dolyame.commit_on_webhook:
-            items = [build_item(item_name, order["amount"])]
+            items = [
+                build_item(
+                    item_name,
+                    order["amount"],
+                    receipt=cfg.dolyame_item_receipt(order["product_id"]),
+                )
+            ]
             commit = await dolyame_client.commit(oid, order["amount"], items)
             if not commit.success:
                 log.error("webhook Долями: commit не удался order=%s — 503", oid)

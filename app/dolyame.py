@@ -252,13 +252,29 @@ class DolyameClient:
 # ── вспомогательное ──────────────────────────────────────────────────────────
 
 
-def build_item(name: str, amount_kopecks: int, quantity: int = 1) -> dict[str, Any]:
+def build_item(
+    name: str,
+    amount_kopecks: int,
+    quantity: int = 1,
+    receipt: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """Позиция заказа Долями из товара. price — за единицу (рубли); инвариант
-    amount = Σ(quantity·price) держится точно (Decimal)."""
+    amount = Σ(quantity·price) держится точно (Decimal).
+
+    `receipt` — объект фискализации позиции (tax/payment_method/payment_object/
+    measurement_unit); кладётся только при включённой фискализации. None — не
+    добавляем (нефискальный заказ). Должен совпадать на create и commit."""
     per_unit = (
         kopecks_to_rubles(amount_kopecks) / Decimal(quantity)
     ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return {"name": name[:128], "quantity": quantity, "price": _num(per_unit)}
+    item: dict[str, Any] = {
+        "name": name[:128],
+        "quantity": quantity,
+        "price": _num(per_unit),
+    }
+    if receipt is not None:
+        item["receipt"] = receipt
+    return item
 
 
 def _num(value: Decimal) -> float:

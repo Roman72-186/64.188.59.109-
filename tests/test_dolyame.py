@@ -35,7 +35,9 @@ EXAMPLE = os.path.join(
 ALLOWED_IP = "91.194.226.10"  # внутри 91.194.226.0/23
 
 
-def make_config(commit_on_webhook: bool = True) -> AppConfig:
+def make_config(
+    commit_on_webhook: bool = True, fiscalization: str = "disabled"
+) -> AppConfig:
     raw = yaml.safe_load(open(EXAMPLE, encoding="utf-8"))
     raw["server"]["secret_token"] = SECRET_TOKEN
     raw["server"]["public_url"] = "https://test.local"
@@ -47,6 +49,7 @@ def make_config(commit_on_webhook: bool = True) -> AppConfig:
         "login": "lg",
         "password": "pw",
         "commit_on_webhook": commit_on_webhook,
+        "fiscalization": fiscalization,
     }
     raw["payment_methods"]["dolyami"]["provider"] = "dolyame"
     return AppConfig.model_validate(raw)
@@ -108,6 +111,7 @@ class FakeDolyame:
 
     async def commit(self, order_id, amount_kopecks, items) -> DolyameResult:
         self.commit_calls.append(order_id)
+        self.commit_items = items
         if not self.commit_succeeds:
             return DolyameResult(success=False, error_code="409", order_id=order_id)
         self.status = "committed"  # переход статуса: следующий info вернёт committed
@@ -336,3 +340,51 @@ def test_build_item_invariant():
     assert item["price"] == 99.0 and item["quantity"] == 1
     # amount == Σ(quantity*price)
     assert Decimal(str(item["price"])) * item["quantity"] == kopecks_to_rubles(9900)
+
+
+def test_build_item_no_receipt_when_none():
+    # Нефискальный заказ: ключ receipt в позицию не кладётся (старое поведение).
+    assert "receipt" not in build_item("Курс", 9900)
+
+
+def test_build_item_includes_receipt():
+    rc = {"tax": "none", "payment_method": "full_payment",
+          "payment_object": "service", "measurement_unit": "шт"}
+    assert build_item("Курс", 9900, receipt=rc)["receipt"] == rc
+
+
+def test_fiscalization_disabled_emits_no_params_and_no_item_receipt():
+    cfg = make_config(fiscalization="disabled")
+    assert cfg.dolyame.fiscalization_settings() == {"type": "disabled"}
+    assert cfg.dolyame_item_receipt("course_basic") is None
+
+
+def test_fiscalization_enabled_requests_receipt_on_commit():
+    cfg = make_config(fiscalization="enabled")
+    # type:enabled один не гарантирует чек — нужен явный флаг на закоммиченные позиции.
+    assert cfg.dolyame.fiscalization_settings() == {
+        "type": "enabled",
+        "params": {"create_receipt_for_committed_items": True},
+    }
+    # Поля позиции берутся из блока receipt (54-ФЗ) — чек Долями = чеку карты.
+    assert cfg.dolyame_item_receipt("course_basic") == {
+        "tax": "none",
+        "payment_method": "full_prepayment",
+        "payment_object": "service",
+        "measurement_unit": "шт",
+    }
+
+
+def test_fiscalization_enabled_item_receipt_in_create_and_commit(tmp_path):
+    # Сквозь /init-payment и commit: receipt-объект уходит в позицию на ОБОИХ
+    # вызовах (требование Долями — items на create и commit совпадают).
+    env = _make_env(make_config(fiscalization="enabled"), tmp_path)
+    order = _init_order(env)
+    created_item = env.dolyame.create_calls[0]["items"][0]
+    assert created_item["receipt"]["payment_object"] == "service"
+    r = _webhook(env, order["order_id"])
+    assert r.status_code == 200, r.text
+    assert env.dolyame.commit_calls  # commit состоялся
+    # commit (захват) — именно та позиция, по которой Долями выставит чек клиенту.
+    committed_item = env.dolyame.commit_items[0]
+    assert committed_item["receipt"] == created_item["receipt"]

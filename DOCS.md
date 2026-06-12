@@ -27,9 +27,10 @@
 ## 1. Что это и зачем
 
 У шалам.io нет входящего webhook, поэтому нельзя напрямую «дёрнуть сценарий» после оплаты.
-Прокладка решает это так: принимает оплату (эквайринг Т-Банка для карты/СБП/рассрочки и
-прямой Partner API Долями для Долями), а после успешной оплаты назначает контакту тег
-через API шалам.io. Внутри платформы авторассылка стартует по этому тегу.
+Прокладка решает это так: принимает оплату (эквайринг Т-Банка для карты/СБП/рассрочки,
+прямой Partner API Долями для Долями, T-Bank Credit Broker для кредита/рассрочки на
+крупные суммы), а после успешной оплаты назначает контакту тег через API шалам.io.
+Внутри платформы авторассылка стартует по этому тегу.
 
 **Разделение ответственности:**
 - прокладка отвечает за оплату и безопасность;
@@ -93,13 +94,15 @@ tbank_proxy/
 ├── deploy/              # tbank-proxy.service (systemd), nginx.conf.example, ssh-access.md
 ├── tests/               # pytest-сюита (unit + интеграционные)
 └── app/
-    ├── main.py          # FastAPI + create_app(): /init-payment, /webhook/tbank, /webhook/dolyame, /health
+    ├── main.py          # FastAPI + create_app(): /init-payment, /webhook/tbank, /webhook/dolyame,
+    │                     #   /webhook/tbank_credit, /health + фоновый поллер Credit Broker
     ├── config.py        # загрузка/валидация config.yaml (pydantic)
     ├── schemas.py       # схемы запроса/ответа + статусы /init-payment
     ├── tbank.py         # клиент Т-Банка: Init, GetState, подпись Token
     ├── dolyame.py       # клиент прямого Partner API Долями: mTLS+Basic, create/info/commit (см. §5)
+    ├── tbank_credit.py  # клиент T-Bank Credit Broker (forma.tbank.ru): create/commit/cancel/info (см. §5)
     ├── shalamo.py       # конфиг-адаптер shalamov.io (endpoint'ы из config.yaml — см. §9)
-    ├── database.py      # SQLite: платежи, идемпотентность (paid_at / tag_assigned_at)
+    ├── database.py      # SQLite: платежи, идемпотентность (paid_at / tag_assigned_at), очередь поллера
     └── logging_setup.py # логи в файл+stdout, маскировка секретов
 ```
 
@@ -320,8 +323,15 @@ dolyame:
   захолдированы) → прокладка вызывает **`commit`** (реальный захват всей суммы) → `committed`
   → ставится тег. `commit_on_webhook: false` — ставить тег уже на холде, без захвата.
 - **Фискализация.** `disabled` — чек не шлём (проверено: боевой checkout Долями проходит
-  без чека). Если конкретный мерчант потребует чек — `enabled` + доработка адаптера
-  (полноценный объект `fiscalization_settings`).
+  без чека). `enabled` — прокладка фискализирует заказ: в `fiscalization_settings`
+  передаётся `type: enabled` + `params.create_receipt_for_committed_items: true` (в
+  двухфазности чек формируется на **commit**/захвате), а в каждую позицию добавляется
+  объект `receipt` (`tax`/`payment_method`/`payment_object`/`measurement_unit`). Поля
+  чека берутся из общего блока `receipt` (та же 54-ФЗ модель, что у эквайринга) —
+  чтобы чек Долями и чек карты не расходились; `measurement_unit` фиксирован `шт`.
+  **Важно:** код передаёт данные чека, но сам чек печатает онлайн-касса/ОФД на стороне
+  Долями — она должна быть подключена у мерчанта, иначе письмо не придёт (флаг в конфиге
+  это не заменяет). Контакт получателя (`email`/`phone`) уже уходит в `client_info`.
 - **Креды и сертификат — секреты.** Если фигурировали в переписке — ротировать у менеджера.
 
 > ⚠️ `commit` на webhook = **реальное списание** у клиента. Возвраты вне scope прокладки
@@ -331,6 +341,87 @@ dolyame:
 > одобрение делает **банк/скоринг Долями** на стороне покупателя (может прийти `rejected`).
 > Телефон покупателя в форме нужен в формате `+79991234567`; неверный телефон даёт на
 > форме generic-ошибку «сервис временно недоступен».
+
+### Блок T-Bank Credit Broker — кредит/рассрочка (`provider: tbank_credit`)
+
+Способ «Кредит/рассрочка» (для **крупных сумм**, недоступных в обычной рассрочке
+эквайринга) ведётся через **T-Bank Credit Broker** (`forma.tbank.ru`) — отдельный
+продукт Т-Банка, не эквайринг. Покупатель оформляет заявку на кредит/рассрочку и
+подписывает документы на стороне `forma.tbank.ru`. Включается полем `provider:
+tbank_credit`:
+
+```yaml
+credit_threshold_kopecks: 3000000   # 30 000 ₽: amount >= порога -> авто-апгрейд на кредит
+
+tbank_credit:
+  shop_id: "<ShopId из ЛК Т-Бизнеса>"        # раздел «Магазины» -> POS-кредитование
+  showcase_id: "<ShowcaseId из ЛК>"          # код веб-ресурса (витрины)
+  api_password: "<пароль API>"               # ЛК -> Магазины -> Настройки API
+  promo_code: "default"                      # PromoCode продукта (рассрочка/кредит)
+  api_url: "https://forma.tbank.ru/api/partners/v2"   # боевой
+  timeout_seconds: 15
+  commit_on_webhook: false   # false = авто-подтверждение в ЛК (рекомендуется);
+                              # true = ручной Commit через API (в течение 14 дней после signed)
+  webhook_allowed_subnet: "" # CIDR подсети Credit Broker; пусто = принимать от всех
+  poll_interval_seconds: 60  # 0 = опрос выключен (только /webhook/tbank_credit, если дойдёт)
+
+payment_methods:
+  credit:
+    label: "Кредит/рассрочка"
+    provider: tbank_credit
+```
+
+- **Авторизация разная по методам.** `Create` — БЕЗ Basic Auth (`shopId`/`showcaseId`/
+  `promoCode` едут в теле запроса). `Commit`/`Cancel`/`Info` — Basic Auth
+  (`showcase_id:api_password`, Base64). Это особенность API forma.tbank.ru, не баг.
+- **Суммы — в рублях** (Decimal, без float-погрешности), как у Долями. `amount` товара
+  по-прежнему в копейках.
+- **Статусы заявки:** `new → inprogress → approved → signed → canceled | rejected`.
+  `signed` = клиент подписал документы (деньги захолдированы или уже перечислены при
+  авто-подтверждении в ЛК). `canceled`/`rejected` — терминальный отказ.
+- **`provider: tbank_credit` требует блок `tbank_credit`** в конфиге (иначе приложение
+  упадёт на старте с понятной ошибкой).
+
+> ⚠️ **`webhookURL` в `Create` НЕ передаётся.** T-Bank Credit Broker отклоняет `Create`,
+> если домен `webhookURL` не совпадает с доменом витрины **клиента** (а у витрин разных
+> клиентов он свой — прокладка на это не влияет). Поэтому статус заявки прокладка узнаёт
+> **фоновым опросом `GET /info`** (`tbank_credit.poll_interval_seconds`, основной канал,
+> не зависит от домена) — общая функция `process_credit_status()` в `app/main.py`.
+> `POST /webhook/tbank_credit` остаётся рабочим как **дополнительный** канал — сработает,
+> только если домен webhookURL клиента совпадёт с доменом прокладки.
+
+**Несколько продуктов (рассрочка на разные сроки) — per-метод `promo_code`.** Если в ЛК
+подключено несколько продуктов Credit Broker (например, рассрочка 3/6/10 месяцев — у
+каждого свой `PromoCode`), заведи под каждый срок отдельный способ оплаты с
+переопределением `promo_code` (наследует остальные настройки из блока `tbank_credit`):
+
+```yaml
+payment_methods:
+  installment_3:
+    label: "Рассрочка на 3 месяца"
+    provider: tbank_credit
+    promo_code: "<promo_code продукта «3 месяца» из ЛК>"
+  installment_6:
+    label: "Рассрочка на 6 месяцев"
+    provider: tbank_credit
+    promo_code: "<promo_code продукта «6 месяцев» из ЛК>"
+  installment_10:
+    label: "Рассрочка на 10 месяцев"
+    provider: tbank_credit
+    promo_code: "<promo_code продукта «10 месяцев» из ЛК>"
+```
+
+> 💡 **У каждого срока рассрочки свой диапазон допустимых сумм** — задаётся в ЛК для
+> каждого `PromoCode` отдельно (банк/скоринг проверяет сумму против лимитов конкретного
+> продукта). Если сумма заявки вне диапазона продукта, `Create` либо отклоняется, либо
+> заявка сразу уходит в `rejected`. Уточни границы у менеджера для каждого подключённого
+> срока и держи `credit_threshold_kopecks` выше минимума самого "длинного" продукта.
+
+> 💡 **Авто-апгрейд по сумме.** Если `amount` запроса `/init-payment` ≥
+> `credit_threshold_kopecks` и у товара в `payment_methods` есть способ с
+> `provider: tbank_credit`, прокладка **сама подменяет** `payment_method` на кредитный —
+> независимо от того, что прислал бот. Если подходящего кредитного способа у товара нет,
+> авто-апгрейд не срабатывает и платёж идёт обычным способом.
 
 ---
 
@@ -429,6 +520,13 @@ server {
 >
 > **Долями** через эквайринг Т-Банка больше не ведётся — это отдельный провайдер
 > (прямой Partner API): настройка mTLS-сертификата, кредов и webhook — см. §5 и §7.
+
+> **Кредит/рассрочка через Credit Broker** настраивается отдельно от эквайринга — в
+> личном кабинете **business.tbank.ru**, раздел **«POS-кредитование»** (не «Магазины»
+> эквайринга). Там подключаются продукты (сроки рассрочки/кредит), для каждого выдаётся
+> свой `PromoCode`, и берутся `ShopId`/`ShowcaseId`/пароль API для блока `tbank_credit`
+> (см. §5). `webhookURL` туда не передаётся (см. §5) — статус приходит через фоновый
+> опрос `GET /info`.
 
 ---
 
@@ -580,6 +678,33 @@ X-Secret-Token: <тот же токен, что в config.yaml>
 - `/info` недоступен / `commit` не удался / тег не назначен → **HTTP `503`** — Долями
   повторит webhook (`commit` идемпотентен: на повторе статус уже `committed`, повторно не зовётся).
 
+### `POST /webhook/tbank_credit`
+
+Принимает уведомления **T-Bank Credit Broker** (когда способ идёт через
+`provider: tbank_credit`). Это **дополнительный** канал — сработает только если домен
+`webhookURL` клиента совпал с доменом прокладки (см. §5); основной канал — фоновый
+поллер (ниже).
+
+- **Защита — IP-allowlist** (`tbank_credit.webhook_allowed_subnet`; пусто = принимать
+  от всех), как и у `/webhook/dolyame`: тело не подписано, источник истины — `GET /info`.
+- Тело используется только чтобы найти `orderNumber` → дальше вызывается общая функция
+  **`process_credit_status()`**, которая делает `GET /info`, проверяет статус
+  (`signed`/`canceled`/`rejected`/...), сверяет сумму, при `signed` (если
+  `commit_on_webhook: true`) зовёт `Commit`, идемпотентно назначает тег успеха или тег
+  отказа (`fail_tags_by_method`).
+- успех / нечего делать → HTTP `200`; временная ошибка (shalamo недоступен и т.п.) →
+  `503` — Credit Broker повторит webhook.
+
+### Фоновый поллер заявок Credit Broker
+
+Если `tbank_credit.poll_interval_seconds > 0`, при старте приложения запускается
+фоновая задача: каждые N секунд берёт из БД заявки `provider: tbank_credit` без
+`tag_assigned_at`/`fail_tag_assigned_at` (`database.get_pending_credit_orders`,
+не старше `CREDIT_POLL_MAX_AGE_SECONDS` = 30 дней) и для каждой вызывает
+**`process_credit_status()`** — то же самое, что делает `/webhook/tbank_credit`, но
+без зависимости от webhook. Это **основной** способ узнать финальный статус заявки
+(`signed`/`canceled`/`rejected`) для Credit Broker.
+
 ### Переменные, которые получает контакт после оплаты
 
 | Переменная | Пример | Описание |
@@ -684,6 +809,25 @@ sqlite3 payments.db "SELECT order_id, last_error FROM payments WHERE paid_at IS 
 подчёркивания), авторассылка активна, аудитория настроена так, что реагирует
 на уже существующий контакт.
 
+**Credit Broker: `Create` отклоняется ошибкой про `webhookURL`/домен.**
+Прокладка не передаёт `webhookURL` в `Create` (см. §5) — если ошибка всё равно про
+домен, проверь, что в коде/конфиге нигде вручную не добавлен `webhookURL`. Источник
+истины по статусу заявки — `GET /info` через фоновый поллер, не webhook.
+
+**Credit Broker: заявка осталась без тега, в логах нет ошибок.**
+Проверь `tbank_credit.poll_interval_seconds` — если `0`, опрос выключен и статус
+обновится только если дойдёт `/webhook/tbank_credit` (что бывает не всегда, см. §5).
+Поставь `poll_interval_seconds: 60` и перезапусти сервис. Найти зависшие заявки:
+
+```bash
+sqlite3 payments.db "SELECT order_id, status, created_at FROM payments WHERE payment_method LIKE '%credit%' AND tag_assigned_at IS NULL AND fail_tag_assigned_at IS NULL;"
+```
+
+**Credit Broker: заявка сразу `rejected` для конкретной суммы.**
+У каждого подключённого продукта (`PromoCode`, например «рассрочка на 6 месяцев») в ЛК
+свой диапазон допустимых сумм. Проверь сумму заявки против лимитов именно этого
+продукта у менеджера Т-Банка — частая причина мгновенного отказа без видимой ошибки.
+
 ---
 
 ## 14. Чеклист перед боем
@@ -697,7 +841,8 @@ sqlite3 payments.db "SELECT order_id, last_error FROM payments WHERE paid_at IS 
 - [ ] В Т-Банке прописан webhook `https://your-domain.ru/webhook/tbank`
 - [ ] В Т-Банке активированы нужные способы эквайринга (особенно Рассрочка)
 - [ ] Долями (если используется): задан блок `dolyame` (login/password + mTLS cert/key, абсолютные пути), notification URL `https://your-domain.ru/webhook/dolyame`, у менеджера подтверждена активация боевого приёма, IP-подсеть webhook в allowlist
-- [ ] Настроен nginx + HTTPS (форвардит `X-Real-IP` — нужно для `/webhook/dolyame`), `curl https://your-domain.ru/health` отвечает
+- [ ] Credit Broker (если используется): задан блок `tbank_credit` (`shop_id`/`showcase_id`/`api_password`/`promo_code` из business.tbank.ru → POS-кредитование), `poll_interval_seconds > 0`, при нескольких сроках рассрочки — per-метод `promo_code` и проверены лимиты сумм каждого продукта у менеджера, `credit_threshold_kopecks` задан осознанно
+- [ ] Настроен nginx + HTTPS (форвардит `X-Real-IP` — нужно для `/webhook/dolyame` и `/webhook/tbank_credit`), `curl https://your-domain.ru/health` отвечает
 - [ ] Прогнан `python test_flow.py` — все PASS
 - [ ] Сделан тестовый платёж картой, в логах `✅ Платёж подтверждён`, тег проставился
 - [ ] Проверены остальные способы оплаты

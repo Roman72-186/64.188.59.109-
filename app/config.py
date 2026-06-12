@@ -152,9 +152,17 @@ class DolyameConfig(BaseModel):
     webhook_allowed_subnet: str = "91.194.226.0/23"
 
     def fiscalization_settings(self) -> dict[str, Any]:
-        """Объект fiscalization_settings для тела запросов Долями (oneOf по type)."""
+        """Объект fiscalization_settings для тела запросов Долями (oneOf по type).
+
+        При enabled явно просим чек на ЗАКОММИЧЕННЫЕ позиции
+        (`params.create_receipt_for_committed_items`): в нашей двухфазности
+        (create=холд → commit=захват) клиентский чек формируется именно на commit.
+        Без этого флага type:enabled может не выставить чек (тихий no-op)."""
         if self.fiscalization == "enabled":
-            return {"type": "enabled"}
+            return {
+                "type": "enabled",
+                "params": {"create_receipt_for_committed_items": True},
+            }
         return {"type": "disabled"}
 
 
@@ -365,6 +373,31 @@ class AppConfig(BaseModel):
     def merged_extra_params(self, method: str) -> dict[str, Any]:
         mc = self.payment_methods.get(method)
         return dict(mc.extra_params) if mc else {}
+
+    def dolyame_item_receipt(self, product_id: str) -> dict[str, Any] | None:
+        """Объект `receipt` для позиции заказа Долями при включённой фискализации.
+
+        Возвращает None, если у Долями fiscalization != enabled (тогда receipt в
+        позицию не кладётся — старое поведение). Поля берутся из блока `receipt`
+        (та же 54-ФЗ модель, что у эквайринга Т-Банка) — чтобы чек Долями и чек
+        карты не расходились. Должен совпадать на create и commit (требование API).
+        Перечни значений (tax/payment_method/payment_object) — общие с 54-ФЗ.
+        """
+        if self.dolyame is None or self.dolyame.fiscalization != "enabled":
+            return None
+        product = self.products.get(product_id)
+        r = self.receipt
+        tax = (product.tax if product and product.tax else (r.tax if r else "none"))
+        return {
+            "tax": tax,
+            "payment_method": (
+                r.payment_method if r and r.payment_method else "full_payment"
+            ),
+            "payment_object": (
+                r.payment_object if r and r.payment_object else "commodity"
+            ),
+            "measurement_unit": "шт",
+        }
 
     def build_receipt(
         self,
