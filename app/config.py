@@ -151,19 +151,35 @@ class DolyameConfig(BaseModel):
     # Подсеть, с которой принимаются webhook'и Долями (CIDR). Прочие источники игнорим.
     webhook_allowed_subnet: str = "91.194.226.0/23"
 
-    def fiscalization_settings(self) -> dict[str, Any]:
-        """Объект fiscalization_settings для тела запросов Долями (oneOf по type).
+    def fiscalization_settings(self, operation: str = "create") -> dict[str, Any] | None:
+        """Объект fiscalization_settings для тела запросов Долями (oneOf по type),
+        либо None — тогда ключ в тело НЕ кладётся.
 
-        При enabled явно просим чек на ЗАКОММИЧЕННЫЕ позиции
-        (`params.create_receipt_for_committed_items`): в нашей двухфазности
-        (create=холд → commit=захват) клиентский чек формируется именно на commit.
-        Без этого флага type:enabled может не выставить чек (тихий no-op)."""
-        if self.fiscalization == "enabled":
-            return {
-                "type": "enabled",
-                "params": {"create_receipt_for_committed_items": True},
+        ВАЖНО: `params` РАЗНЫЕ по операциям (см. swagger.json, *FiscalizationParams):
+          • commit → CommitFiscalizationParams: ОБЯЗАТЕЛЬНЫ все три флага
+            (create_receipt_for_committed_items / _added_items / _returned_items).
+            Если послать только один — Долями отвечает HTTP 400 «Неверный формат
+            запроса» (это и есть причина прошлых отказов commit, не «нет кассы»:
+            create те же неполные params принимает, т.к. CreateFiscalizationParams
+            — пустой объект, а commit валидирует required-поля).
+          • create/refund → Create/RefundFiscalizationParams: полей нет, шлём только
+            `type` (params не добавляем).
+        В нашем потоке чек формируется на закоммиченные позиции; добавленных и
+        возвращаемых позиций нет, поэтому _added/_returned = False.
+
+        При disabled возвращаем None (а НЕ {type: disabled}): без подключённой кассы
+        у мерчанта чек не печатается, но это НЕ ошибка формата — commit с пустым
+        телом (без fiscalization_settings и позиционного receipt) проходит штатно."""
+        if self.fiscalization != "enabled":
+            return None
+        fs: dict[str, Any] = {"type": "enabled"}
+        if operation == "commit":
+            fs["params"] = {
+                "create_receipt_for_committed_items": True,
+                "create_receipt_for_added_items": False,
+                "create_receipt_for_returned_items": False,
             }
-        return {"type": "disabled"}
+        return fs
 
 
 class PaymentMethodConfig(BaseModel):
@@ -240,6 +256,13 @@ class AppConfig(BaseModel):
     # Если amount >= порога и у товара есть метод с provider='tbank_credit' —
     # запрошенный способ оплаты автоматически заменяется кредитным.
     credit_threshold_kopecks: int | None = None
+    # Глобальные теги по способу оплаты (cart-режим). Когда /init-payment приходит
+    # с product_id, которого НЕТ в products (платформа сама передаёт состав заказа
+    # в `cart` и сумму в `amount`, не привязываясь к серверному товару), тег доступа
+    # берётся отсюда по способу оплаты, а тег отказа — из fail_tags_by_method.
+    # Пусто = cart-режим выключен (неизвестный product_id → invalid_payment_method).
+    tags_by_method: dict[str, str] = Field(default_factory=dict)
+    fail_tags_by_method: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _cross_checks(self) -> "AppConfig":
@@ -357,18 +380,25 @@ class AppConfig(BaseModel):
         product = self.products.get(product_id)
         return bool(product and method in product.payment_methods)
 
+    def global_tag_for(self, method: str) -> str | None:
+        """Глобальный тег доступа по способу (cart-режим, без серверного товара)."""
+        return self.tags_by_method.get(method)
+
     def tag_for(self, product_id: str, method: str) -> str | None:
+        """Тег доступа: из товара, если он есть в конфиге; иначе (cart-режим) —
+        глобальный tags_by_method по способу оплаты."""
         product = self.products.get(product_id)
-        if not product:
-            return None
-        return product.tags_by_method.get(method)
+        if product is not None:
+            return product.tags_by_method.get(method)
+        return self.tags_by_method.get(method)
 
     def fail_tag_for(self, product_id: str, method: str) -> str | None:
-        """Тег «отказ оплаты» для способа (None, если не задан → тег не шлётся)."""
+        """Тег «отказ оплаты» для способа (None, если не задан → тег не шлётся).
+        Для неизвестного товара (cart-режим) — глобальный fail_tags_by_method."""
         product = self.products.get(product_id)
-        if not product:
-            return None
-        return product.fail_tags_by_method.get(method)
+        if product is not None:
+            return product.fail_tags_by_method.get(method)
+        return self.fail_tags_by_method.get(method)
 
     def merged_extra_params(self, method: str) -> dict[str, Any]:
         mc = self.payment_methods.get(method)
@@ -401,33 +431,30 @@ class AppConfig(BaseModel):
 
     def build_receipt(
         self,
-        product_id: str,
+        name: str,
+        amount: int,
+        tax: str | None = None,
         email: str | None = None,
         phone: str | None = None,
-        amount: int | None = None,
     ) -> dict[str, Any] | None:
         """Собрать объект Receipt (54-ФЗ) для Init Т-Банка.
 
         Возвращает None, если чек выключен/не настроен (тогда Receipt не шлётся).
-        Чек состоит из одной позиции = оплачиваемый товар (сумма в копейках,
-        Amount = Price * Quantity). Контакт получателя — email/phone из запроса,
-        иначе fallback из конфига. `amount` переопределяет сумму товара (если
-        платформа передала свою сумму в /init-payment) — иначе Init и Receipt
-        разойдутся и Т-Банк отклонит платёж.
+        Чек состоит из одной позиции (сумма в копейках, Amount = Price * Quantity).
+        `name`/`amount` — имя позиции и сумма, как их передаёт вызывающий (из товара
+        конфига либо из `cart`/`amount` запроса в cart-режиме). Контакт получателя —
+        email/phone из запроса, иначе fallback из конфига. `tax` переопределяет
+        ставку НДС позиции (иначе receipt.tax).
         """
         if self.receipt is None or not self.receipt.enabled:
             return None
-        product = self.products.get(product_id)
-        if product is None:
-            return None
-        item_amount = amount if amount is not None else product.amount
         r = self.receipt
         item: dict[str, Any] = {
-            "Name": product.name[:128],
-            "Price": item_amount,
+            "Name": name[:128],
+            "Price": amount,
             "Quantity": 1,
-            "Amount": item_amount,
-            "Tax": product.tax or r.tax,
+            "Amount": amount,
+            "Tax": tax or r.tax,
         }
         if r.payment_method:
             item["PaymentMethod"] = r.payment_method

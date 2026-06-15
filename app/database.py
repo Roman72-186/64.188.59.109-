@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS payments (
     tbank_status      TEXT,                         -- последний сырой статус Т-Банка
     pay_url           TEXT,
     tag_name          TEXT,
+    item_name         TEXT,                         -- имя позиции (cart): для совпадения позиций Долями create/commit
     paid_at           TEXT,                         -- банк подтвердил оплату (CONFIRMED)
     tag_assigned_at   TEXT,                         -- тег успешно назначен в shalamo
     fail_tag_assigned_at TEXT,                       -- тег ОТКАЗА назначен (отдельный факт)
@@ -93,6 +94,8 @@ class Database:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(payments)")}
         if "fail_tag_assigned_at" not in cols:
             conn.execute("ALTER TABLE payments ADD COLUMN fail_tag_assigned_at TEXT")
+        if "item_name" not in cols:
+            conn.execute("ALTER TABLE payments ADD COLUMN item_name TEXT")
 
     # ── чтение ──────────────────────────────────────────────────────────────
 
@@ -187,14 +190,15 @@ class Database:
         payment_method: str,
         amount: int,
         tag_name: Optional[str],
+        item_name: Optional[str] = None,
     ) -> dict[str, Any]:
         now = _utcnow()
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO payments "
                 "(order_id, contact_id, product_id, payment_method, amount, "
-                " status, tag_name, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                " status, tag_name, item_name, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
                 (
                     order_id,
                     contact_id,
@@ -202,6 +206,7 @@ class Database:
                     payment_method,
                     amount,
                     tag_name,
+                    item_name,
                     now,
                     now,
                 ),

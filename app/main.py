@@ -217,12 +217,16 @@ def create_app(
     # ── создание платежа через прямой Долями ─────────────────────────────────
 
     async def init_dolyame_payment(
-        order_id: str, product: Any, amount: int, req: InitPaymentRequest
+        order_id: str, item_name: str, amount: int, req: InitPaymentRequest
     ) -> JSONResponse:
-        """Создать заказ в прямом Partner API Долями и вернуть link как pay_url."""
+        """Создать заказ в прямом Partner API Долями и вернуть link как pay_url.
+
+        item_name — имя позиции (из товара конфига либо из `cart` запроса). Оно же
+        сохранено в БД и переиспользуется на commit (Долями требует совпадения
+        позиций create/commit)."""
         items = [
             build_item(
-                product.name, amount, receipt=cfg.dolyame_item_receipt(req.product_id)
+                item_name, amount, receipt=cfg.dolyame_item_receipt(req.product_id)
             )
         ]
         client_info: dict[str, Any] = {}
@@ -253,15 +257,17 @@ def create_app(
     # ── создание платежа через Credit Broker ─────────────────────────────────
 
     async def init_credit_payment(
-        order_id: str, product: Any, amount: int, req: InitPaymentRequest, method: str
+        order_id: str, item_name: str, amount: int, req: InitPaymentRequest, method: str
     ) -> JSONResponse:
-        """Создать заявку на кредит/рассрочку через T-Bank Credit Broker."""
+        """Создать заявку на кредит/рассрочку через T-Bank Credit Broker.
+
+        item_name — имя позиции (из товара конфига либо из `cart` запроса)."""
         if credit_client is None:
             log.error("init-payment: Credit Broker не сконфигурирован order=%s", order_id)
             database.mark_failed(order_id, "Credit Broker не сконфигурирован")
             return _resp(InitStatus.PAYMENT_CREATION_FAILED, 502, order_id=order_id)
 
-        items = [build_credit_item(product.name, amount)]
+        items = [build_credit_item(item_name, amount)]
         customer_info: dict[str, Any] = {}
         if req.phone:
             customer_info["phone"] = req.phone
@@ -305,28 +311,50 @@ def create_app(
             log.warning("init-payment: неверный X-Secret-Token")
             return _resp(InitStatus.FORBIDDEN, 403)
 
-        # 2. товар
+        # 2. товар: серверный (из config.products) ЛИБО cart-режим (product_id нет
+        #    в конфиге → платформа сама задаёт состав заказа в `cart` и сумму в
+        #    `amount`, тег доступа берётся из глобального tags_by_method).
         product = cfg.get_product(req.product_id)
-        if product is None:
-            log.warning("init-payment: неизвестный product_id=%s", req.product_id)
-            return _resp(InitStatus.INVALID_PRODUCT, 400)
+        cart_mode = product is None
+        # имя позиции: `cart` от платформы → имя серверного товара → product_id (fallback).
+        item_name = req.cart or (product.name if product else None) or req.product_id
 
         # 3. способ оплаты
-        if not cfg.is_method_allowed(req.product_id, req.payment_method):
-            log.warning(
-                "init-payment: способ '%s' недоступен товару '%s'",
-                req.payment_method, req.product_id,
-            )
-            return _resp(InitStatus.INVALID_PAYMENT_METHOD, 400)
+        if not cart_mode:
+            if not cfg.is_method_allowed(req.product_id, req.payment_method):
+                log.warning(
+                    "init-payment: способ '%s' недоступен товару '%s'",
+                    req.payment_method, req.product_id,
+                )
+                return _resp(InitStatus.INVALID_PAYMENT_METHOD, 400)
+        else:
+            # cart-режим. Если глобальные теги не заданы вовсе — режим выключен,
+            # неизвестный product_id трактуем как неизвестный товар (старое поведение).
+            if not cfg.tags_by_method:
+                log.warning("init-payment: неизвестный product_id=%s", req.product_id)
+                return _resp(InitStatus.INVALID_PRODUCT, 400)
+            # способ должен существовать глобально И иметь глобальный тег.
+            if (
+                req.payment_method not in cfg.payment_methods
+                or cfg.global_tag_for(req.payment_method) is None
+            ):
+                log.warning(
+                    "init-payment: cart-режим — способ '%s' недоступен или без "
+                    "глобального тега (product_id=%s)",
+                    req.payment_method, req.product_id,
+                )
+                return _resp(InitStatus.INVALID_PAYMENT_METHOD, 400)
 
         # 3б. авто-апгрейд до кредита при превышении порога:
         #   если amount >= credit_threshold_kopecks И у товара есть tbank_credit-метод
         #   И запрошенный метод — НЕ tbank_credit (чтобы не зациклиться),
-        #   то переключаем на кредитный способ оплаты.
+        #   то переключаем на кредитный способ оплаты. Только для серверного товара
+        #   (в cart-режиме способ задаёт платформа явно, авто-апгрейда нет).
         amount = req.amount
         effective_method = req.payment_method
         if (
-            cfg.credit_threshold_kopecks is not None
+            not cart_mode
+            and cfg.credit_threshold_kopecks is not None
             and amount >= cfg.credit_threshold_kopecks
             and cfg.provider_for_method(req.payment_method) != "tbank_credit"
         ):
@@ -376,27 +404,31 @@ def create_app(
 
         # 6. создание нового платежа
         order_id = f"{req.product_id}_{req.contact_id}_{secrets.token_hex(4)}"
+        # tag_for уже cart-aware: серверный товар → его тег, иначе глобальный по способу.
         tag = cfg.tag_for(req.product_id, effective_method)
         database.create_payment(
             order_id, req.contact_id, req.product_id, effective_method,
-            amount, tag,
+            amount, tag, item_name=item_name,
         )
         log.info(
-            "init-payment: создан платёж order=%s product=%s method=%s amount=%d",
+            "init-payment: создан платёж order=%s product=%s method=%s amount=%d%s",
             order_id, req.product_id, effective_method, amount,
+            " [cart]" if cart_mode else "",
         )
 
         # 6a. прямой Долями — отдельный провайдер (не эквайринг Т-Банка)
         if cfg.provider_for_method(effective_method) == "dolyame":
-            return await init_dolyame_payment(order_id, product, amount, req)
+            return await init_dolyame_payment(order_id, item_name, amount, req)
 
         # 6б. Credit Broker — кредит/рассрочка
         if cfg.provider_for_method(effective_method) == "tbank_credit":
-            return await init_credit_payment(order_id, product, amount, req, effective_method)
+            return await init_credit_payment(order_id, item_name, amount, req, effective_method)
 
         notification_url = cfg.server.public_url.rstrip("/") + "/webhook/tbank"
         receipt = cfg.build_receipt(
-            req.product_id, email=req.email, phone=req.phone, amount=amount
+            item_name, amount,
+            tax=(product.tax if product else None),
+            email=req.email, phone=req.phone,
         )
         if cfg.receipt and cfg.receipt.enabled and receipt is not None:
             if not receipt.get("Email") and not receipt.get("Phone"):
@@ -408,7 +440,7 @@ def create_app(
         init = await client_for_method(req.payment_method).init_payment(
             order_id=order_id,
             amount=amount,
-            description=product.description,
+            description=(product.description if product else item_name),
             notification_url=notification_url,
             extra_params=cfg.merged_extra_params(req.payment_method),
             receipt=receipt,
@@ -472,6 +504,9 @@ def create_app(
         if tbank_status != "CONFIRMED":
             if tbank_status in NEGATIVE_TBANK_STATUSES:
                 database.mark_failed(oid, f"Т-Банк статус {tbank_status}")
+                fail_tag = cfg.fail_tag_for(order["product_id"], order["payment_method"])
+                if fail_tag and database.capture_fail_tag(oid):
+                    await assign_failure_tag(order, fail_tag, attempts=WEBHOOK_TAG_ATTEMPTS)
             log.info("webhook: статус %s — доступ не выдаём order=%s", tbank_status, oid)
             return PlainTextResponse("OK")
 
@@ -589,9 +624,11 @@ def create_app(
             )
             return PlainTextResponse("OK")
 
-        # 7. двухфазность: на wait_for_commit захватываем холд (commit), затем доступ
+        # 7. двухфазность: на wait_for_commit захватываем холд (commit), затем доступ.
+        # Имя позиции — из сохранённого item_name (Долями требует совпадения позиций
+        # create/commit); fallback на имя товара/product_id для старых заказов.
         product = cfg.get_product(order["product_id"])
-        item_name = product.name if product else order["product_id"]
+        item_name = order["item_name"] or (product.name if product else order["product_id"])
         if info.status in STATUS_WAIT_FOR_COMMIT and cfg.dolyame.commit_on_webhook:
             items = [
                 build_item(

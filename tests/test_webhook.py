@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import os
+
+import yaml
+
+from app.config import AppConfig
 from app.tbank import build_token
 
 BASIC = {"contact_id": "c1", "product_id": "course_basic", "payment_method": "card", "amount": 9900}
+
+EXAMPLE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.example.yaml"
+)
 
 
 def signed_webhook(payload: dict, password: str = "testpw") -> dict:
@@ -72,6 +81,35 @@ def test_non_confirmed_status_no_access(env):
     row = env.db.get_by_order_id(order["order_id"])
     assert row["tag_assigned_at"] is None
     assert row["status"] == "failed"
+    # для "card" тег отказа не настроен (как раньше) — ничего не назначаем
+    assert row["fail_tag_assigned_at"] is None
+    assert env.shalamo.tag_calls == []
+
+
+def test_non_confirmed_status_assigns_fail_tag_when_configured(env_factory):
+    raw = yaml.safe_load(open(EXAMPLE, encoding="utf-8"))
+    raw["server"]["secret_token"] = "A" * 64
+    raw["server"]["public_url"] = "https://test.local"
+    raw["tbank"]["terminal_key"] = "TestKey"
+    raw["tbank"]["terminal_password"] = "testpw"
+    raw["shalamo"]["api_key"] = "shkey"
+    raw["products"]["course_basic"]["fail_tags_by_method"]["card"] = "fail_card_basic"
+    env = env_factory(AppConfig.model_validate(raw))
+
+    order_id = env.client.post(
+        "/init-payment", json=BASIC, headers={"X-Secret-Token": env.secret}
+    ).json()["order_id"]
+    order = env.db.get_by_order_id(order_id)
+
+    payload = _confirmed_payload(order)
+    payload["Status"] = "REJECTED"
+    r = env.client.post("/webhook/tbank", json=signed_webhook(payload))
+    assert r.status_code == 200 and r.text == "OK"
+    row = env.db.get_by_order_id(order_id)
+    assert row["status"] == "failed"
+    assert row["tag_assigned_at"] is None
+    assert row["fail_tag_assigned_at"] is not None
+    assert env.shalamo.tag_calls == [("tag", "c1", "fail_card_basic")]
 
 
 def test_idempotent_duplicate_webhook(env):

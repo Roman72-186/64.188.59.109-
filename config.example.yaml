@@ -171,6 +171,18 @@ payment_methods:
   #   provider: tbank_credit
   #   promo_code: "installment_..._6_..."   # код продукта "6 месяцев" из ЛК
 
+# ── Глобальные теги по способу оплаты (cart-режим) ──────────────────────────
+# Когда /init-payment приходит с product_id, которого НЕТ в products ниже,
+# платформа сама передаёт состав заказа в поле `cart` и сумму в `amount`, не
+# привязываясь к серверному товару. Тег доступа тогда берётся отсюда по способу
+# оплаты, тег отказа — из fail_tags_by_method. Если оба блока пусты/не заданы —
+# cart-режим выключен (неизвестный product_id → invalid_product, прежнее поведение).
+# tags_by_method:
+#   card: paid_card
+#   dolyami: paid_dolyami
+# fail_tags_by_method:
+#   dolyami: fail_dolyami
+
 # ── Товары. Ключ словаря = product_id, который передаёт бот ─────────────────
 products:
   course_basic:

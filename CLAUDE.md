@@ -40,7 +40,7 @@ forma.tbank.ru) → клиент подписывает документы (`sig
 venv\Scripts\pip install -r requirements.txt        # Windows
 cp config.example.yaml config.yaml                  # заполнить ключи + secret_token
 
-venv\Scripts\python -m pytest -q                    # 90 тестов: unit + интеграционные
+venv\Scripts\python -m pytest -q                    # 96 тестов: unit + интеграционные
 venv\Scripts\python test_flow.py                    # автономный прогон потока на моках
 venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск; GET /health -> {"status":"ok"}
 ```
@@ -76,6 +76,15 @@ venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск;
   подписано → источник истины `GET /info`; доверенность отправителя — по **IP-allowlist**
   (`webhook_allowed_subnet`, реальный IP из `X-Real-IP` от nginx). Та же модель идемпотентности
   и 503-повтора, что у Т-Банка. `provider: dolyame` требует блок `dolyame` в конфиге.
+  **Фискализация (чек 54-ФЗ на почту клиента, конфиг-driven):** при `dolyame.fiscalization:
+  enabled` в `Create`/`Commit` шлётся `fiscalization_settings: {type: enabled, params:
+  {create_receipt_for_committed_items: true}}` + в каждую позицию `receipt`
+  (`tax`/`payment_method`/`payment_object`/`measurement_unit`, поля из общего блока `receipt`,
+  `measurement_unit` фиксирован `шт` — см. `AppConfig.dolyame_item_receipt`). Чек формируется
+  Долями на **commit** (двухфазность), позиции в `Create` и `Commit` ОБЯЗАНЫ совпадать. Прокладка
+  лишь передаёт данные — печатает чек касса/ОФД на стороне мерчанта у Долями; без подключённой
+  кассы письмо не придёт (не баг прокладки). `disabled` → `fiscalization_settings: {type: disabled}`,
+  позиционный `receipt` не шлётся.
 - **T-Bank Credit Broker — отдельный провайдер** ([app/tbank_credit.py](app/tbank_credit.py)):
   способ с `provider: tbank_credit` идёт через `forma.tbank.ru/api/partners/v2/orders`
   (НЕ эквайринг). `Create` — без авторизации (shopId+showcaseId+promoCode в теле, из ЛК
@@ -120,10 +129,12 @@ venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск;
   получателя обязательны по 54-ФЗ — из `/init-payment` либо fallback `receipt.email/phone`.
 - **Тег отказа (`fail_tags_by_method`)** — отдельный опциональный факт в БД
   (`fail_tag_assigned_at`, `capture_fail_tag`/`mark_fail_tag_assigned` в
-  [app/database.py](app/database.py)): при терминальном негативном статусе у Долями
-  или Credit Broker (rejected/canceled) прокладка best-effort назначает тег отказа
-  (триггер авторассылки «оплата не прошла») — не гейт доступа. Если для способа тег
-  не задан в `tags_by_method`/`fail_tags_by_method`, ничего не шлётся (старое поведение).
+  [app/database.py](app/database.py)): при терминальном негативном статусе у Долями,
+  Credit Broker (rejected/canceled) или обычного эквайринга Т-Банка
+  (`NEGATIVE_TBANK_STATUSES` в `/webhook/tbank`: REJECTED/DEADLINE_EXPIRED/CANCELED/
+  AUTH_FAIL) прокладка best-effort назначает тег отказа (триггер авторассылки «оплата
+  не прошла») — не гейт доступа. Если для способа тег не задан в
+  `tags_by_method`/`fail_tags_by_method`, ничего не шлётся (старое поведение).
 - **Логи** — `logs/app.log` + stdout; секреты маскируются (`logging_setup.mask_secrets`).
 
 ## Деплой / доступ

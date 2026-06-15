@@ -188,10 +188,10 @@ class DolyameClient:
             "amount": _num(kopecks_to_rubles(amount_kopecks)),
             "items": items,
         }
-        body: dict[str, Any] = {
-            "order": order,
-            "fiscalization_settings": self.config.fiscalization_settings(),
-        }
+        body: dict[str, Any] = {"order": order}
+        fs = self.config.fiscalization_settings("create")
+        if fs is not None:
+            body["fiscalization_settings"] = fs
         if client_info:
             body["client_info"] = client_info
         if notification_url:
@@ -219,11 +219,13 @@ class DolyameClient:
         ВАЖНО про идемпотентность: повторный commit недопустим. Вызывающий код
         (webhook) сперва смотрит info(): commit зовётся ТОЛЬКО если статус
         wait_for_commit. На повторном webhook статус уже committed → commit не зовётся."""
-        body = {
+        body: dict[str, Any] = {
             "amount": _num(kopecks_to_rubles(amount_kopecks)),
             "items": items,
-            "fiscalization_settings": self.config.fiscalization_settings(),
         }
+        fs = self.config.fiscalization_settings("commit")
+        if fs is not None:
+            body["fiscalization_settings"] = fs
         res = await self._request("POST", f"/v1/orders/{order_id}/commit", body)
         res.order_id = order_id
         return res
@@ -239,11 +241,13 @@ class DolyameClient:
     ) -> DolyameResult:
         """POST /v1/orders/{orderId}/refund — возврат. Возвраты вне scope прокладки
         (CLAUDE.md), метод оставлен заделом на будущее."""
-        body = {
+        body: dict[str, Any] = {
             "amount": _num(kopecks_to_rubles(amount_kopecks)),
             "returned_items": returned_items,
-            "fiscalization_settings": self.config.fiscalization_settings(),
         }
+        fs = self.config.fiscalization_settings("refund")
+        if fs is not None:
+            body["fiscalization_settings"] = fs
         res = await self._request("POST", f"/v1/orders/{order_id}/refund", body)
         res.order_id = order_id
         return res

@@ -39,7 +39,7 @@ def _cfg_with_receipt(**receipt_overrides) -> AppConfig:
 
 def test_build_receipt_structure():
     cfg = _cfg_with_receipt()
-    r = cfg.build_receipt("course_basic", email="buyer@example.com", amount=9900)
+    r = cfg.build_receipt("Курс: Базовый тариф", 9900, email="buyer@example.com")
     assert r["Taxation"] == "usn_income"
     assert r["Email"] == "buyer@example.com"  # из запроса, не fallback
     assert "Phone" not in r
@@ -56,13 +56,13 @@ def test_build_receipt_structure():
 
 def test_build_receipt_fallback_contact():
     cfg = _cfg_with_receipt()
-    r = cfg.build_receipt("course_basic", amount=9900)  # бот не передал email/phone
+    r = cfg.build_receipt("Курс: Базовый тариф", 9900)  # бот не передал email/phone
     assert r["Email"] == "fallback@example.com"
 
 
 def test_build_receipt_disabled_returns_none():
     cfg = _cfg_with_receipt(enabled=False)
-    assert cfg.build_receipt("course_basic", email="b@e.com") is None
+    assert cfg.build_receipt("Курс", 9900, email="b@e.com") is None
 
 
 def test_no_receipt_block_returns_none():
@@ -74,14 +74,17 @@ def test_no_receipt_block_returns_none():
     raw.pop("receipt", None)
     cfg = AppConfig.model_validate(raw)
     assert cfg.receipt is None
-    assert cfg.build_receipt("course_basic", email="b@e.com") is None
+    assert cfg.build_receipt("Курс", 9900, email="b@e.com") is None
 
 
-def test_product_tax_override():
+def test_tax_override():
+    # Явный tax (вызывающий передаёт product.tax или из cart) важнее receipt.tax.
     cfg = _cfg_with_receipt(tax="vat20")
-    cfg.products["course_basic"].tax = "vat10"
-    r = cfg.build_receipt("course_basic", email="b@e.com")
-    assert r["Items"][0]["Tax"] == "vat10"  # переопределение товара важнее receipt.tax
+    r = cfg.build_receipt("Курс", 9900, tax="vat10", email="b@e.com")
+    assert r["Items"][0]["Tax"] == "vat10"
+    # Без явного tax — берётся receipt.tax.
+    r2 = cfg.build_receipt("Курс", 9900, email="b@e.com")
+    assert r2["Items"][0]["Tax"] == "vat20"
 
 
 def test_receipt_excluded_from_token():

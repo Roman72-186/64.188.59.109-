@@ -355,17 +355,39 @@ def test_build_item_includes_receipt():
 
 def test_fiscalization_disabled_emits_no_params_and_no_item_receipt():
     cfg = make_config(fiscalization="disabled")
-    assert cfg.dolyame.fiscalization_settings() == {"type": "disabled"}
+    # disabled → fiscalization_settings вообще не формируется (None), ключ в тело
+    # не кладётся: боевой Долями отвергает commit с фискальным блоком без кассы.
+    assert cfg.dolyame.fiscalization_settings() is None
     assert cfg.dolyame_item_receipt("course_basic") is None
+
+
+def test_fiscalization_disabled_no_item_receipt_in_create_and_commit(tmp_path):
+    """При disabled позиции create и commit НЕ содержат receipt (рабочий формат
+    боевого Долями без онлайн-кассы; fiscalization_settings проверяется отдельно)."""
+    env = _make_env(make_config(fiscalization="disabled"), tmp_path)
+    order = _init_order(env)
+    assert "receipt" not in env.dolyame.create_calls[0]["items"][0]
+    r = _webhook(env, order["order_id"])
+    assert r.status_code == 200, r.text
+    assert env.dolyame.commit_calls  # commit состоялся
+    assert "receipt" not in env.dolyame.commit_items[0]
 
 
 def test_fiscalization_enabled_requests_receipt_on_commit():
     cfg = make_config(fiscalization="enabled")
-    # type:enabled один не гарантирует чек — нужен явный флаг на закоммиченные позиции.
-    assert cfg.dolyame.fiscalization_settings() == {
+    # commit → CommitFiscalizationParams требует ВСЕ три флага (swagger), иначе
+    # Долями отвечает 400 «Неверный формат запроса».
+    assert cfg.dolyame.fiscalization_settings("commit") == {
         "type": "enabled",
-        "params": {"create_receipt_for_committed_items": True},
+        "params": {
+            "create_receipt_for_committed_items": True,
+            "create_receipt_for_added_items": False,
+            "create_receipt_for_returned_items": False,
+        },
     }
+    # create/refund → params-полей нет, шлём только type (пустой *FiscalizationParams).
+    assert cfg.dolyame.fiscalization_settings("create") == {"type": "enabled"}
+    assert cfg.dolyame.fiscalization_settings("refund") == {"type": "enabled"}
     # Поля позиции берутся из блока receipt (54-ФЗ) — чек Долями = чеку карты.
     assert cfg.dolyame_item_receipt("course_basic") == {
         "tax": "none",

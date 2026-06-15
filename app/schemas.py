@@ -21,8 +21,16 @@ class InitStatus(str, Enum):
 
 class InitPaymentRequest(BaseModel):
     contact_id: str = Field(..., min_length=1, description="внутренний ID контакта shalamov.io")
+    # product_id — ключ дедупликации/идемпотентности и префикс order_id. Если он
+    # есть в products (config.yaml) — поведение прежнее (товар на сервере). Если
+    # НЕТ — cart-режим: имя позиции берётся из `cart`, тег доступа — из глобального
+    # tags_by_method по способу оплаты. Платформа всё равно передаёт product_id.
     product_id: str = Field(..., min_length=1)
     payment_method: str = Field(..., min_length=1)
+    # Название позиции (товар/услуга) от платформы — для чека и позиции Долями/кредита.
+    # Используется в cart-режиме (product_id нет в конфиге). Если задан — переопределяет
+    # имя серверного товара.
+    cart: Optional[str] = Field(default=None, min_length=1, description="название позиции от платформы")
     # Опционально переопределяет сумму товара из config.yaml (в копейках). Запрос
     # идёт по секретному токену от доверенной платформы (shalamov.io/бот) — конечный
     # клиент его не видит и подменить сумму не может.
