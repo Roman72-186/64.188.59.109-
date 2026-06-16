@@ -109,6 +109,28 @@ venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск;
     секунд опрашивает `GET /info` по заявкам без `tag_assigned_at`/`fail_tag_assigned_at`
     (`database.get_pending_credit_orders`, отсечка `CREDIT_POLL_MAX_AGE_SECONDS` = 30 дней) —
     основной канал, не зависит от домена.
+- **CloudKassir — единая онлайн-касса (фискализация 54-ФЗ)** ([app/cloudkassir.py](app/cloudkassir.py)):
+  карту/СБП через эквайринг Т-Банка фискализирует касса автоматически (чек идёт сам),
+  а Долями и рассрочка/кредит своих чеков НЕ дают. CloudKassir (CloudPayments KKT,
+  `POST {api_url}/kkt/receipt`, Basic `public_id:api_secret`) подключается как касса
+  мерчанта и пробивает чек по этим каналам. **Модель — отдельный факт `receipt_sent_at`
+  в БД** (как `paid_at`/`tag_assigned_at`): фискализация РАЗВЯЗАНА с webhook и назначением
+  тега — **фоновая реконсиляция** (`cloudkassir.poll_interval_seconds`) пробивает чек по
+  оплаченным заказам без `receipt_sent_at` (`database.get_unfiscalized_orders` по каналам
+  из `cloudkassir.fiscalize_providers`, отсечка `CLOUDKASSIR_MAX_AGE_SECONDS`=30 дней),
+  поэтому транзиентный сбой кассы не теряется и не задерживает выдачу доступа. **Не гейт
+  доступа**, best-effort. Идемпотентность: `InvoiceId`=`order_id` дедуплицируется кассой
+  (+ `X-Request-ID`), `mark_receipt_sent` — только при `Queued`. Признаки расчёта
+  (`taxation`/`tax`/`payment_method`/`payment_object`) берутся из общего блока `receipt`
+  (маппинг строк 54-ФЗ → числовые коды KKT в `cloudkassir.py`), чтобы чек совпадал с
+  картой/СБП. Email/Phone сохраняются в БД на `/init-payment` (для отложенного чека),
+  иначе fallback `receipt.email/phone`. **Миграция `receipt_sent_at` бэкфиллит** существующие
+  заказы как «обработанные» → касса не пробивает чеки задним числом по заказам до её
+  подключения. При фискализации Долями через CloudKassir у Долями ставим
+  `fiscalization: disabled` (иначе двойной чек). **СТАТУС: собрано, ждёт боевой валидации** —
+  схема `/kkt/receipt` не подтверждена реальным ответом (см. «PENDING LIVE VALIDATION» в
+  [app/cloudkassir.py](app/cloudkassir.py)); боевой `fiscalize_providers: [dolyame]` (рассрочка
+  отложена до согласования полей чека).
 - **Два независимых факта в БД** ([app/database.py](app/database.py)): `paid_at`
   (банк подтвердил) и `tag_assigned_at` (доступ выдан). На этом стоит вся логика
   «оплачено, но тег не назначен» (PRD §7.3) и идемпотентность.

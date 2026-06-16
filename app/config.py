@@ -182,6 +182,29 @@ class DolyameConfig(BaseModel):
         return fs
 
 
+class CloudKassirConfig(BaseModel):
+    """Онлайн-касса CloudKassir (CloudPayments KKT) — фискализация 54-ФЗ для каналов,
+    которые не дают чек сами (Долями, рассрочка/кредит). Карту/СБП фискализирует
+    касса на стороне эквайринга Т-Банка — их сюда НЕ включаем (иначе двойной чек).
+
+    Признаки расчёта (taxation/tax/payment_method/payment_object) берутся из общего
+    блока `receipt`, чтобы чек CloudKassir совпадал с чеком карты/СБП.
+    """
+
+    enabled: bool = False
+    public_id: str       # логин Basic-авторизации (pk_...)
+    api_secret: str      # пароль Basic-авторизации
+    inn: str             # ИНН организации (поле Inn в теле)
+    api_url: str = "https://api.cloudpayments.ru"
+    timeout_seconds: float = 15.0
+    # Провайдеры оплаты, чьи заказы фискализируем через CloudKassir. Обычно
+    # [dolyame, tbank_credit]. Пусто = ничего не фискализируем (касса выключена де-факто).
+    fiscalize_providers: list[str] = Field(default_factory=list)
+    # Период (сек) фоновой реконсиляции: пробить чек по оплаченным заказам без
+    # receipt_sent_at (источник истины — paid_at). 0 = фоновая фискализация выключена.
+    poll_interval_seconds: float = 30.0
+
+
 class PaymentMethodConfig(BaseModel):
     label: str
     extra_params: dict[str, Any] = Field(default_factory=dict)
@@ -252,6 +275,9 @@ class AppConfig(BaseModel):
     dolyame: DolyameConfig | None = None
     # T-Bank Credit Broker. Если не задан — способы с provider='tbank_credit' запрещены.
     tbank_credit: TBankCreditConfig | None = None
+    # Онлайн-касса CloudKassir (фискализация Долями/рассрочки). Если не задан или
+    # enabled=false — прокладка чеки через CloudKassir не пробивает.
+    cloudkassir: CloudKassirConfig | None = None
     # Порог в копейках для авто-апгрейда до кредита. None = отключено.
     # Если amount >= порога и у товара есть метод с provider='tbank_credit' —
     # запрошенный способ оплаты автоматически заменяется кредитным.
@@ -301,6 +327,15 @@ class AppConfig(BaseModel):
                     f"способ оплаты '{name}': promo_code задан, но provider != "
                     f"'tbank_credit'"
                 )
+        # CloudKassir: fiscalize_providers — только известные провайдеры.
+        if self.cloudkassir is not None:
+            allowed = {"tbank", "dolyame", "tbank_credit"}
+            bad = [p for p in self.cloudkassir.fiscalize_providers if p not in allowed]
+            if bad:
+                raise ValueError(
+                    f"cloudkassir.fiscalize_providers: неизвестные провайдеры {bad} "
+                    f"(допустимо: {sorted(allowed)})"
+                )
         return self
 
     def provider_for_method(self, method: str) -> str:
@@ -321,6 +356,18 @@ class AppConfig(BaseModel):
         return [
             name for name, mc in self.payment_methods.items()
             if mc.provider == "tbank_credit"
+        ]
+
+    def cloudkassir_methods(self) -> list[str]:
+        """Способы оплаты, чьи заказы фискализируем через CloudKassir (провайдер
+        способа входит в cloudkassir.fiscalize_providers). Пусто, если касса
+        выключена/не задана."""
+        ck = self.cloudkassir
+        if ck is None or not ck.enabled or not ck.fiscalize_providers:
+            return []
+        return [
+            name for name, mc in self.payment_methods.items()
+            if mc.provider in ck.fiscalize_providers
         ]
 
     def credit_method_for(self, product_id: str) -> str | None:

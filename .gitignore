@@ -24,3 +24,13 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 *.egg-info/
+
+# не часть прокладки — отдельный продаваемый кит, гайды и ассеты (вне репо намеренно)
+bnpl-proxy-kit/
+.codex_build_dolyami_docx.py
+BNPL-GUIDE.md
+DOLYAMI-INSTALLMENTS-INTEGRATION-GUIDE.*
+*.png
+*.jpg
+*.jpeg
+*.docx

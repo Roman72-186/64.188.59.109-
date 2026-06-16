@@ -137,6 +137,30 @@ receipt:
 #   # он свой). Поэтому статус заявки получаем фоновым опросом GET /info:
 #   poll_interval_seconds: 60       # 0 = опрос выключен (только /webhook/tbank_credit)
 
+# ── Онлайн-касса CloudKassir (CloudPayments KKT) — фискализация 54-ФЗ ─────────
+# Единая касса для каналов, которые НЕ дают чек сами (Долями, рассрочка/кредит).
+# Карту/СБП через эквайринг Т-Банка фискализирует касса автоматически — их в
+# fiscalize_providers НЕ включаем, иначе ДВОЙНОЙ чек.
+# Поток: оплата подтверждена (paid_at) -> фоновая реконсиляция каждые
+# poll_interval_seconds пробивает чек POST /kkt/receipt -> receipt_sent_at.
+# Идемпотентность: InvoiceId=order_id дедуплицируется кассой (+ X-Request-ID).
+# Признаки расчёта берутся из блока `receipt` (taxation/tax/payment_method/
+# payment_object) — чтобы чек CloudKassir совпадал с чеком карты/СБП.
+# Перед боем: POST /test (CloudKassirClient.ping) проверяет креды БЕЗ чека.
+#
+# cloudkassir:
+#   enabled: false                  # true — включить фискализацию через CloudKassir
+#   public_id: "pk_CHANGE_ME"       # Public ID (логин Basic-авторизации)
+#   api_secret: "CHANGE_ME"         # API Secret (пароль Basic-авторизации)
+#   inn: "0000000000"               # ИНН организации (поле Inn в теле чека)
+#   api_url: "https://api.cloudpayments.ru"
+#   timeout_seconds: 15
+#   fiscalize_providers: ["dolyame"]   # ТОЛЬКО каналы без своего чека. Карту/СБП
+#                                       # фискализирует эквайринг, рассрочку/кредит —
+#                                       # сторона Т-Банка автоматически; их НЕ включать
+#                                       # (будет двойной чек).
+#   poll_interval_seconds: 30       # 0 = фоновая фискализация выключена
+
 # ── Способы оплаты: общие доп. параметры Init Т-Банка ───────────────────────
 payment_methods:
   card:

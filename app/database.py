@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS payments (
     pay_url           TEXT,
     tag_name          TEXT,
     item_name         TEXT,                         -- имя позиции (cart): для совпадения позиций Долями create/commit
+    email             TEXT,                         -- контакт получателя чека (из /init-payment) — для отложенной фискализации
+    phone             TEXT,
+    receipt_sent_at   TEXT,                         -- чек пробит в кассе CloudKassir (отдельный факт, как paid_at/tag_assigned_at)
     paid_at           TEXT,                         -- банк подтвердил оплату (CONFIRMED)
     tag_assigned_at   TEXT,                         -- тег успешно назначен в shalamo
     fail_tag_assigned_at TEXT,                       -- тег ОТКАЗА назначен (отдельный факт)
@@ -96,6 +99,21 @@ class Database:
             conn.execute("ALTER TABLE payments ADD COLUMN fail_tag_assigned_at TEXT")
         if "item_name" not in cols:
             conn.execute("ALTER TABLE payments ADD COLUMN item_name TEXT")
+        if "email" not in cols:
+            conn.execute("ALTER TABLE payments ADD COLUMN email TEXT")
+        if "phone" not in cols:
+            conn.execute("ALTER TABLE payments ADD COLUMN phone TEXT")
+        if "receipt_sent_at" not in cols:
+            conn.execute("ALTER TABLE payments ADD COLUMN receipt_sent_at TEXT")
+            # Бэкфилл (одноразово при первом добавлении столбца): отметить ВСЕ уже
+            # существующие заказы как «чек обработан», чтобы фоновая фискализация
+            # CloudKassir НЕ пробивала чеки задним числом по заказам, завершённым до
+            # подключения кассы (часть из них уже фискализирована вручную в ЛК).
+            # Фискализируются только заказы, созданные ПОСЛЕ этой миграции.
+            conn.execute(
+                "UPDATE payments SET receipt_sent_at = updated_at "
+                "WHERE receipt_sent_at IS NULL"
+            )
 
     # ── чтение ──────────────────────────────────────────────────────────────
 
@@ -166,6 +184,43 @@ class Database:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    def get_unfiscalized_orders(
+        self, payment_methods: list[str], max_age_seconds: int
+    ) -> list[dict[str, Any]]:
+        """Оплаченные заказы (paid_at IS NOT NULL), по которым чек ещё НЕ пробит
+        (receipt_sent_at IS NULL), для каналов, фискализируемых через CloudKassir.
+        Источник истины — paid_at: фискализация развязана с назначением тега, поэтому
+        транзиентный сбой кассы не теряется (заказ остаётся в выборке до успеха).
+        `max_age_seconds` отсекает давно заброшенные заказы."""
+        if not payment_methods:
+            return []
+        threshold = (
+            datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+        ).isoformat()
+        placeholders = ",".join("?" for _ in payment_methods)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"SELECT * FROM payments "
+                f"WHERE payment_method IN ({placeholders}) "
+                f"  AND paid_at IS NOT NULL AND receipt_sent_at IS NULL "
+                f"  AND created_at >= ? "
+                f"ORDER BY created_at ASC",
+                (*payment_methods, threshold),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def mark_receipt_sent(self, order_id: str) -> None:
+        """Чек успешно принят кассой (Queued). Фиксируем receipt_sent_at —
+        заказ больше не попадает в get_unfiscalized_orders."""
+        now = _utcnow()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE payments SET "
+                "receipt_sent_at = COALESCE(receipt_sent_at, ?), updated_at = ? "
+                "WHERE order_id = ?",
+                (now, now, order_id),
+            )
+
     def find_paid_order(
         self, contact_id: str, product_id: str
     ) -> Optional[dict[str, Any]]:
@@ -191,14 +246,16 @@ class Database:
         amount: int,
         tag_name: Optional[str],
         item_name: Optional[str] = None,
+        email: Optional[str] = None,
+        phone: Optional[str] = None,
     ) -> dict[str, Any]:
         now = _utcnow()
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO payments "
                 "(order_id, contact_id, product_id, payment_method, amount, "
-                " status, tag_name, item_name, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                " status, tag_name, item_name, email, phone, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
                 (
                     order_id,
                     contact_id,
@@ -207,6 +264,8 @@ class Database:
                     amount,
                     tag_name,
                     item_name,
+                    email,
+                    phone,
                     now,
                     now,
                 ),

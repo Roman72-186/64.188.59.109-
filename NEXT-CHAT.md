@@ -9,65 +9,69 @@
 ## Промт
 
 ```
-Контекст: T-Bank Credit Broker (рассрочка installment_3/6/10) интегрирован и был
-задеплоен (commits ec2ea92, f5e7bf6, 85/85 тестов), но реальный /init-payment падал:
+Контекст: прокладка-платёжка (Python 3.10+ / FastAPI / SQLite) между провайдерами
+(Т-Банк эквайринг card/sbp, Долями, T-Bank Credit Broker рассрочка) и shalamov.io.
+Рабочая папка открыта (git, ветка main). Сервер 64.188.59.109, systemd-сервис
+tbank-proxy.service, код в /opt/tbank_proxy, доступ — plink/pscp (см.
+deploy/ssh-access.md, пароль в .env → SSH_PASSWORD; Windows-OpenSSH к серверу НЕ
+цепляется, только PuTTY plink). venv на CPython 3.12.
+Тесты: venv\Scripts\python -m pytest tests -q -p no:cacheprovider --import-mode=importlib
+(103 passed; без --import-mode сборщик падает на кириллическом пути — это не баг кода).
 
-  "validations":{"webhookURL":"...домен... должен совпадать с доменом вашего сайта"}
+ЧТО СДЕЛАНО В ПРОШЛОМ ЧАТЕ (15-16.06.2026), КОММИТ 9d78f07 — НЕ ЗАПУШЕН (только local):
+1. ФИКС ФИСКАЛИЗАЦИИ ДОЛЯМИ. Симптом: оплата проходит, тег ставится, но commit падал
+   с HTTP 400 BAD_REQUEST «Неверный формат запроса» (в логах ~10 повторов на заказ),
+   заказы коммитились вручную в ЛК Долями. Причина (сверка со swagger.json): на commit
+   схема CommitFiscalizationParams требует ВСЕ ТРИ флага (create_receipt_for_committed_items
+   / _added_items / _returned_items), а CreateFiscalizationParams — пустой объект,
+   поэтому create те же неполные params принимал (200), а commit отбивал (400).
+   Прокладка слала только один флаг. Фикс: AppConfig.fiscalization_settings(operation)
+   стал operation-aware (commit → 3 флага; create/refund → только type; disabled → None),
+   3 вызова в app/dolyame.py передают свою операцию. Исправлен ошибочный комментарий в
+   config.py («нет кассы» НЕ причина этого 400). ЗАДЕПЛОЕНО на сервер (pscp, бэкап в
+   /opt/tbank_proxy/_backup/20260616-001928/), config.yaml → fiscalization: enabled,
+   сервис перезапущен, /health ok.
+2. CART-РЕЖИМ (отдельная предыдущая незакоммиченная фича, попала в тот же коммит по
+   решению владельца): глобальные tags_by_method/fail_tags_by_method в AppConfig для
+   заказов без серверного товара (платформа шлёт состав в cart + сумму в amount);
+   build_receipt теперь принимает name/amount/tax вместо product_id. Затронуты
+   config.py, main.py, schemas.py, database.py, tests + новый tests/test_cart_mode.py.
 
-Расследование (см. «Уточнения» 10-11.06.2026 ниже) установило: точка Credit Broker
-зарегистрирована на домен клиента novoseltsevyayest.ru (НЕ домен прокладки
-pay.sushi-house-39.ru); вкладка «Интеграция» в ЛК НЕ имеет полей под webhook вообще;
-поле «HTTP-уведомления о статусе заявки» принимает только apex-домен сайта,
-поддомены (pay.novoseltsevyayest.ru) ОТКЛОНЯЕТ. DNS/поддомен — тупиковый путь.
+ГЛАВНАЯ ЗАДАЧА НОВОГО ЧАТА — закрыть верификацию фикса фискализации:
+Фикс доказан по swagger, но swagger.required ≠ гарантия runtime-валидации, а это живой
+платёжный поток. Нужен БОЕВОЙ тест: следующий реальный заказ по Долями должен дать в
+логах /opt/tbank_proxy/logs/app.log строку «Долями POST /v1/orders/.../commit OK» +
+статус committed ИМЕННО ОТ ПРОКЛАДКИ (НЕ ручной commit в ЛК, как было у order=888_... 
+15.06). До этого момента фикс — «очень вероятно верный», но не подтверждён. Следить за
+логами по grep 'commit|фискал|Долями'. Если commit снова 400 — это уже реальный вопрос
+кассы/ОФД у мерчанта Долями (но по CLAUDE.md это должно проявляться как «нет письма»,
+а не 400 — чистый commit 200 = ожидаемый исход).
 
-РЕШЕНИЕ (реализовано локально 11.06.2026, 90/90 тестов зелёные, НЕ ЗАДЕПЛОЕНО):
-webhookURL вообще убран из Create. Подтверждено реальным curl на forma.tbank.ru
-(пользователь прогнал сам) — Create БЕЗ webhookURL прошёл, вернул заявку
-{"id":"e18e65aa-647a-4c7c-9c0c-04b6c351c008","link":"https://forma.tbank.ru/online/sso/..."}
-(тестовая заявка, не подписана клиентом, безобидна, истечёт сама — не трогать).
+ДОПОЛНИТЕЛЬНО (всплыло при разборе отправки чеков по всем провайдерам, см. «Уточнения»
+16.06.2026):
+- РАССРОЧКА/КРЕДИТ (Credit Broker) НЕ ШЛЁТ НИКАКИХ ФИСКАЛЬНЫХ ДАННЫХ. build_credit_item
+  = только {name, price, quantity}, ни Receipt, ни fiscalization_settings, ни налогов.
+  Если по рассрочке нужен 54-ФЗ чек — он сейчас не формируется. Решить с владельцем:
+  касса мерчанта пробивает сама ИЛИ дорабатывать (проверить, поддерживает ли API
+  forma.tbank.ru передачу данных чека — через Context7/доку, в build_credit_item их нет).
+- FALLBACK-EMAIL чека карта/СБП: если бот в /init-payment не передаёт email/phone
+  клиента, ВСЕ чеки уходят на fallback receipt.email из config.yaml
+  (сейчас jwluwelirka@gmail.com), а не покупателю. Стоит проверить, что бот реально
+  шлёт email клиента (по логам email не виден — не логируется).
 
-Источник истины как и раньше — GET /info (Basic auth, без ограничений по домену).
-Вместо webhook — общая функция process_credit_status() в app/main.py, вызывается:
-  1) из /webhook/tbank_credit (если у БУДУЩЕГО клиента домен совпадёт — сработает);
-  2) из НОВОГО фонового поллера _poll_credit_orders() — основной канал теперь.
+ПЕРВЫЙ ШАГ: спросить владельца, нужно ли (а) запушить коммит 9d78f07 в origin/main,
+(б) заняться верификацией фискализации по логам, (в) фискализацией рассрочки или
+(г) проверкой fallback-email. Прочитать CLAUDE.md (разделы Долями / Credit Broker /
+чек 54-ФЗ), app/config.py (fiscalization_settings, build_receipt, dolyame_item_receipt),
+app/dolyame.py, app/main.py (init-payment ~428, init_credit_payment ~259, webhook
+Долями ~617), app/tbank_credit.py (build_credit_item ~76), swagger.json.
 
-Новое в конфиге: tbank_credit.poll_interval_seconds (число секунд, 0 = выключено,
-дефолт). database.get_pending_credit_orders() выбирает заявки без tag_assigned_at/
-fail_tag_assigned_at, отсечка CREDIT_POLL_MAX_AGE_SECONDS = 30 дней (app/main.py).
-
-ЗАДАЧА НОВОГО ЧАТА: задеплоить и проверить реальный installment_3 e2e.
-
-ПРОЕКТ
-Рабочая папка открыта (git, ветка main). Прокладка Python 3.10+ / FastAPI / SQLite.
-Сначала прочитай: CLAUDE.md (раздел Credit Broker уже обновлён под новую схему),
-app/tbank_credit.py (docstring), app/main.py (process_credit_status,
-_poll_credit_orders, lifespan, init_credit_payment), app/config.py
-(TBankCreditConfig.poll_interval_seconds, credit_broker_methods),
-app/database.py (get_pending_credit_orders), deploy/ssh-access.md.
-venv на CPython 3.12. Тесты: venv\Scripts\python -m pytest -q (90 passed).
-
-ШАГИ ДЕПЛОЯ
-1. Запушить коммит с этими изменениями (если ещё не запушен), задеплоить на
-   64.188.59.109 (plink/pscp — см. deploy/ssh-access.md и память про деплой:
-   маскированные diff'ы config.yaml, бэкап перед заменой, git reset --hard
-   только с подтверждением владельца).
-2. В СЕРВЕРНЫЙ config.yaml добавить tbank_credit.poll_interval_seconds (рекомендация
-   60-120 сек) — в локальном репо его нет (0/не задан), это ОЖИДАЕМОЕ расхождение
-   при структурном diff'е, добавить вручную.
-3. Прогнать pytest на сервере (90 passed), перезапустить tbank-proxy.service,
-   проверить /health.
-4. Тестовый /init-payment с payment_method=installment_3, amount >= 310800 копеек
-   (минимум 3108₽ для installment_3 — см. находку 11.06.2026), force: true.
-   Ожидаем pay_url БЕЗ ошибки webhookURL (это и есть критерий успеха).
-5. Подождать ~poll_interval после изменения статуса заявки (signed/rejected),
-   проверить логи (`poll Credit Broker: ...`) и таблицу payments — tag_assigned_at
-   / fail_tag_assigned_at должны проставиться так же, как раньше через webhook.
-
-ОСТАВШИЕСЯ TODO (из предыдущих хэндоффов, ниже не нумерую заново):
-- Создать в shalamov.io теги paid_installment_basic / fail_installment_basic
-  + автоворонки.
-- webhook_allowed_subnet для tbank_credit (сейчас пусто) — менее критично теперь,
-  основной канал статусов — поллинг, не входящий webhook.
+ОСТАВШИЕСЯ TODO ИЗ ПРОШЛЫХ ХЭНДОФФОВ (не закрыты):
+- Касса/ОФД на стороне Долями у мерчанта (вне кода) — нужна для реальной доставки письма.
+- shalamov.io теги для shop2 (paid_card_shop_basic/fail_card_shop_basic) и
+  installment (paid/fail_installment_*_basic) + автоворонки.
+- Позитив Долями wait_for_commit → commit → тег боевым плательщиком с пройденным скорингом.
+- webhook_allowed_subnet для tbank_credit (пусто; основной канал — поллинг).
 ```
 
 ---
@@ -384,3 +388,117 @@ Init реально ушёл через новый терминал `17805607529
 - **Деплой:** требуется git push кода (`app/main.py` + `tests/test_webhook.py` +
   CLAUDE.md) + точечная правка серверного `config.yaml` (переименование тегов +
   fail_tags_by_method, бэкап перед заменой) + restart + `/health`.
+
+**16.06.2026 — ФИКС 400 НА COMMIT ФИСКАЛИЗАЦИИ ДОЛЯМИ + CART-РЕЖИМ (коммит `9d78f07`,
+ЗАДЕПЛОЕНО, НЕ ЗАПУШЕНО).** По жалобе «оплата Долями проходит, тег ставится, но
+отправка на фискальник падает 400 Неверный формат запроса» вытащены логи сервера
+(plink, полный read-доступ дал владелец). Картина по `order=888_2853073_420e14a8`:
+`create` с фискальным блоком → HTTP 200, `commit` с тем же блоком → HTTP 400
+`BAD_REQUEST` (повтор ~10 раз 18:09–18:20), в 18:24 заказ стал committed РУЧНЫМ
+commit в ЛК Долями (не прокладкой), в 18:28 владелец выставил `fiscalization: disabled`
++ рестарт 18:29 (обход). Сверка со `swagger.json`: `CommitFiscalizationParams` требует
+ВСЕ 3 флага, `CreateFiscalizationParams` — пустой объект → асимметрия 200/400. Старый
+комментарий в config.py («нет кассы») был ошибочным диагнозом.
+- Фикс: `AppConfig.fiscalization_settings(operation)` operation-aware (commit → 3 флага
+  True/False/False; create/refund → только `type`; disabled → None). `app/dolyame.py` —
+  create/commit/refund передают операцию, блок не кладётся при None. Комментарий исправлен.
+- Деплой: pscp `config.py`+`dolyame.py`, бэкап `/opt/tbank_proxy/_backup/20260616-001928/`,
+  серверный `config.yaml` снова `fiscalization: enabled` (sed), import-check ok, рестарт,
+  `/health` ok, на старте `Прокладка запущена. Товаров: 2`.
+- Cart-режим (предыдущая незакоммиченная работа) включён в тот же коммит по решению
+  владельца («всё одним коммитом»). 103/103 теста зелёные.
+- НЕ вошли в коммит (осознанно, untracked): отдельный продаваемый `bnpl-proxy-kit/` +
+  его гайды (`BNPL-GUIDE.md`, `DOLYAMI-INSTALLMENTS-INTEGRATION-GUIDE.{md,docx}`,
+  `.codex_build_dolyami_docx.py`) — это самостоятельный проект, нельзя смешивать с
+  реальным конфигом репо; и скриншоты/фото (`image.png`, `photo_*.jpg`, `Скриншот-*.png`).
+- **ОСТАЛОСЬ:** боевой тест — `commit OK`+`committed` ОТ ПРОКЛАДКИ на реальном заказе
+  (см. «Промт»). Коммит `9d78f07` не запушен в origin.
+
+**16.06.2026 — РАЗБОР ОТПРАВКИ ЧЕКА ПО ВСЕМ ПРОВАЙДЕРАМ (справка, кода не трогали).**
+- Карта/СБП (Т-Банк эквайринг): объект `Receipt` (54-ФЗ) в `Init`, однофазно;
+  `build_receipt` → Taxation+Items[{Name,Price,Quantity,Amount,Tax,PaymentMethod,
+  PaymentObject}]+Email/Phone; `Receipt` НЕ входит в Token; печатает касса/ОФД Т-Банка
+  после CONFIRMED. В логах нет 309 → терминал принимает чек, касса подключена. Боевые
+  CONFIRMED-платежи 15.06 (payment_id 8680769176 и др.) подтверждают работу.
+- Долями: `fiscalization_settings` (верх) + позиционный `receipt` (tax/payment_method/
+  payment_object/measurement_unit), двухфазно (receipt в create И commit, чек на commit),
+  контакт в `client_info`, суммы в рублях.
+- Рассрочка/кредит (Credit Broker): фискальных данных НЕ передаётся вообще
+  (`build_credit_item` = name/price/quantity). → потенциальный пробел, см. «Промт».
+
+**16.06.2026 (сессия 2) — ЗАКРЫТЫ 4 ТРЕКА ИЗ «ПРОМТА» (кода НЕ трогали, кроме push).**
+Владелец выбрал все 4 задачи; результат по каждой:
+1. **PUSH ВЫПОЛНЕН.** Коммит `9d78f07` (фикс фискализации + cart-режим) запушен в
+   `origin/main` (`416c1a8..9d78f07`). Локаль и origin в синхроне.
+   **ДЕПЛОЙ git-регуляризован:** на сервере git был на `416c1a8` с pscp-правками
+   поверх (фикс залит файлами, не git). Сверено `git diff origin/main`: рабочее дерево
+   отличалось ТОЛЬКО доками/тестами/`config.example.yaml` (app/*.py байт-в-байт = origin,
+   т.е. рантайм уже верный), `config.yaml` в `.gitignore`, бэкапы untracked → потерь нет.
+   `git reset --hard origin/main` → HEAD `9d78f07`, дерево чистое, `config.yaml` сохранён
+   (`fiscalization: enabled`), 103/103 теста на сервере зелёные, `/health` ok. Рестарт
+   НЕ потребовался (PID 206827 уже крутит идентичный код).
+2. **ВЕРИФИКАЦИЯ ФИКСА ФИСКАЛИЗАЦИИ — фикс ПОДТВЕРЖДЁН ЖИВЫМ, runtime-доказательство
+   ждёт реального заказа.** По логам сервера (plink): процесс uvicorn (PID 206827)
+   стартовал **19:20:52 UTC 15.06** — ПОСЛЕ записи пофикшенных файлов (`config.py`
+   mtime 19:19:52, `dolyame.py` 19:19:56, `config.yaml` 19:20:12 UTC) → загружен
+   operation-aware код + `fiscalization: enabled`. Сервер в **UTC**; «00:19 16.06»
+   из хэндоффа = локальное время прошлой машины (UTC+5), бэкап-каталог
+   `_backup/20260616-001928` подтверждает offset. Баговый order=888_2853073_420e14a8
+   (400×10, ручной commit в ЛК 18:24) был ДО рестарта. **С момента рестарта ни одного
+   заказа по Долями не было** (в логах только поллинг Credit Broker) → эмпирическое
+   `commit OK ОТ ПРОКЛАДКИ` пока не наблюдалось. Форсировать нельзя (нужен реальный
+   плательщик с пройденным скорингом). Состояние: «живой и корректный, ждём первого
+   реального заказа Долями».
+3. **ФИСКАЛИЗАЦИЯ РАССРОЧКИ — НЕ ПРОБЕЛ.** Офиц. дока Т-Банка
+   (tbank.ru/business/help/sales/loans/how-to-integrate/API/): по POS-рассрочке/кредиту
+   чек 54-ФЗ выбивается **автоматически на стороне Т-Банка** («Выбивать чек через
+   облачную кассу или сервис фискализации не нужно: система сделает это автоматически»).
+   Значит `build_credit_item` без фискальных полей — корректно по дизайну, а не пробел.
+   Детальная схема `forma.tbank.ru` за auth (403). **Решение владельца:** оставить как
+   есть, перед любыми правками УТОЧНИТЬ У ПОДДЕРЖКИ Т-БАНКА, нужен ли чек от прокладки.
+   (TODO — на стороне владельца, не код.)
+4. **FALLBACK-EMAIL ЧЕКА (карта/СБП) — НЕ ПРОВЕРЯЕТСЯ ИЗ ЛОГОВ.** `email`/`phone` из
+   `/init-payment` НЕ логируются; fallback `receipt.email`/`receipt.phone` в конфиге
+   задан → warning «нет Email/Phone» физически не сработает (его условие — пустые И
+   запрос, И fallback), 0 совпадений в логах ничего не доказывает. **Решение владельца:**
+   САМ проверит почтовый ящик fallback (`receipt.email` в config.yaml): если там чеки
+   многих РАЗНЫХ покупателей — бот НЕ шлёт их email и всё уходит на fallback. (TODO —
+   на стороне владельца. Запасной план, если ящик неинформативен: добавить masked-лог
+   НАЛИЧИЯ email/phone в `/init-payment` — но это код+деплой, не делалось.)
+
+**16.06.2026 (сессия 3) — CloudKassir: касса для Долями (КОД ГОТОВ, НЕ ЗАДЕПЛОЕН/НЕ
+ЗАКОММИЧЕН, ЖДЁТ БОЕВОЙ ВАЛИДАЦИИ).** Владелец: по карте/СБП чеки идут (касса на стороне
+эквайринга Т-Банка), по Долями — нет. Подключаем CloudKassir (CloudPayments KKT,
+`POST api.cloudpayments.ru/kkt/receipt`, Basic Public ID:API Secret) кассой для Долями.
+Реквизиты в `config.yaml` (секреты): `public_id=pk_45fdd72cc3ddb6082e4f23eebeb3b`,
+`api_secret` (дан), `inn=236000893906` (ИП Новосельцов К.Д.), СНО патент, ФФД 1.2,
+fallback-email `yayest.community@yandex.ru`.
+- **Область = ТОЛЬКО Долями.** Карта/СБП фискализируются эквайрингом, рассрочка/кредит —
+  автоматически на стороне Т-Банка (сессия 2 п.3: «выбивать чек через облачную кассу не
+  нужно, система сделает сама»). Поэтому `fiscalize_providers: [dolyame]` — это ФИНАЛЬНАЯ
+  область, НЕ временная: добавлять `tbank_credit`/`tbank` НЕЛЬЗЯ (двойной чек).
+- **Сделано (116 тестов, +13):** `app/cloudkassir.py` (клиент send_receipt+ping, маппинг
+  строк 54-ФЗ→числовые коды KKT, сборка тела); `CloudKassirConfig`+`cloudkassir_methods()`
+  в `config.py`; миграция БД `email`/`phone`/`receipt_sent_at` + **бэкфилл** существующих
+  как «обработано» (НЕ фискализируем задним числом заказы до подключения кассы); в `main.py`
+  `fiscalize_order` + **фоновая реконсиляция** `_fiscalize_pending` (развязана с webhook/тегом:
+  пробивает чек по `paid_at IS NOT NULL AND receipt_sent_at IS NULL` каждые
+  `cloudkassir.poll_interval_seconds`, идемпотентно — InvoiceId=order_id + X-Request-ID,
+  `mark_receipt_sent` только при `Queued`); блоки `cloudkassir` в `config.yaml`/example.
+  У Долями выставлено `fiscalization: disabled` (CloudKassir заменяет → прошлая задача
+  «верификация commit-фискализации Долями» СНЯТА, чек теперь не от Долями).
+- **СТАТУС = «собрано, ждёт боевой валидации», НЕ done.** Тесты проверяют форму JSON,
+  которую мы САМИ задали (мок отдаёт `Success:true`), а НЕ которую примет касса — тот же
+  класс риска, что 400 на commit Долями (required≠runtime). Нерешённые схемные развилки
+  (если касса отбивает 4xx — туда; см. «PENDING LIVE VALIDATION» в `app/cloudkassir.py`):
+  (1) патент без НДС — шлём `Vat: null`, касса может хотеть отсутствие ключа/код «без НДС»
+  (самый вероятный отказ); (2) `Vat` vs `VatRate`; (3) `Quantity` числом vs строкой.
+- **ШАГИ ВАЛИДАЦИИ (по порядку):** (а) задеплоить (git push+pull+restart, миграция на
+  старте; серверный `config.yaml`: блок `cloudkassir` + `dolyame.fiscalization: disabled`);
+  (б) `POST /test` (`CloudKassirClient.ping()`) боевыми кредами — проверяет ТОЛЬКО
+  авторизацию/связь, без чека; (в) один боевой заказ Долями → в логах `🧾 Чек CloudKassir
+  принят`, проверить письмо клиенту, прочитать РЕАЛЬНОЕ тело ответа `/kkt/receipt` (оно
+  разрешит развилки Vat/Quantity). Только (в) переводит статус в «verified».
+- Коммит ещё НЕ создан. Файлы изменены: `app/cloudkassir.py` (новый),
+  `app/{config,database,main}.py`, `config.yaml`, `config.example.yaml`, `CLAUDE.md`,
+  `tests/test_cloudkassir.py` (новый).

@@ -16,6 +16,7 @@ from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .config import AppConfig, get_config
+from .cloudkassir import CloudKassirClient
 from .database import Database
 from .dolyame import (
     STATUS_COMMITTED,
@@ -52,6 +53,10 @@ NEGATIVE_TBANK_STATUSES = {"REJECTED", "DEADLINE_EXPIRED", "CANCELED", "AUTH_FAI
 CREDIT_POLL_TAG_ATTEMPTS = 2
 CREDIT_POLL_MAX_AGE_SECONDS = 30 * 24 * 3600
 
+# Фоновая фискализация CloudKassir: максимальный возраст оплаченного заказа, по
+# которому ещё пытаемся пробить чек (тот же запас, что у опроса Credit Broker).
+CLOUDKASSIR_MAX_AGE_SECONDS = 30 * 24 * 3600
+
 
 def _payment_variables(config: AppConfig, order: dict[str, Any]) -> dict[str, Any]:
     """Платёжные переменные контакта (PRD §7.7) + переменные товара."""
@@ -76,6 +81,7 @@ def create_app(
     shalamo: Optional[ShalamoClient] = None,
     dolyame: Optional[DolyameClient] = None,
     tbank_credit: Optional[TBankCreditClient] = None,
+    cloudkassir: Optional[CloudKassirClient] = None,
 ) -> FastAPI:
     setup_logging()
     cfg = config or get_config()
@@ -91,6 +97,17 @@ def create_app(
     credit_client = tbank_credit
     if credit_client is None and cfg.tbank_credit is not None:
         credit_client = TBankCreditClient(cfg.tbank_credit)
+
+    # Онлайн-касса CloudKassir: инъектированная (тесты) или из конфига, если блок
+    # задан и enabled. Используется фоновой реконсиляцией для фискализации каналов
+    # без собственного чека (Долями, рассрочка).
+    cloudkassir_client = cloudkassir
+    if (
+        cloudkassir_client is None
+        and cfg.cloudkassir is not None
+        and cfg.cloudkassir.enabled
+    ):
+        cloudkassir_client = CloudKassirClient(cfg.cloudkassir, cfg.receipt)
 
     # Клиенты Т-Банка по terminal_key: основной + доп. магазины (напр. отдельный
     # магазин под Долями, чтобы форма показывала только его). Способ оплаты ->
@@ -118,24 +135,38 @@ def create_app(
         database.init_db()
         log.info("Прокладка запущена. Товаров: %d", len(cfg.products))
 
-        poll_task: Optional[asyncio.Task] = None
+        bg_tasks: list[asyncio.Task] = []
         if (
             credit_client is not None
             and cfg.tbank_credit is not None
             and cfg.tbank_credit.poll_interval_seconds > 0
         ):
-            poll_task = asyncio.create_task(_poll_credit_orders())
+            bg_tasks.append(asyncio.create_task(_poll_credit_orders()))
             log.info(
                 "Credit Broker: фоновый опрос /info каждые %.0fс",
                 cfg.tbank_credit.poll_interval_seconds,
             )
 
+        if (
+            cloudkassir_client is not None
+            and cfg.cloudkassir is not None
+            and cfg.cloudkassir.poll_interval_seconds > 0
+            and cfg.cloudkassir_methods()
+        ):
+            bg_tasks.append(asyncio.create_task(_fiscalize_pending()))
+            log.info(
+                "CloudKassir: фоновая фискализация каждые %.0fс (каналы: %s)",
+                cfg.cloudkassir.poll_interval_seconds,
+                ", ".join(cfg.cloudkassir_methods()),
+            )
+
         yield
 
-        if poll_task is not None:
-            poll_task.cancel()
+        for t in bg_tasks:
+            t.cancel()
+        for t in bg_tasks:
             try:
-                await poll_task
+                await t
             except asyncio.CancelledError:
                 pass
 
@@ -213,6 +244,65 @@ def create_app(
             order["order_id"], f"assign_fail_tag failed: {last_error}"
         )
         return False
+
+    # ── фискализация через CloudKassir (касса для Долями/рассрочки) ───────────
+
+    async def fiscalize_order(order: dict[str, Any]) -> bool:
+        """Пробить чек 54-ФЗ по оплаченному заказу через CloudKassir. Best-effort,
+        идемпотентно: InvoiceId=order_id дедуплицируется кассой, а receipt_sent_at
+        фиксируется только при успехе (Queued) — транзиентный сбой кассы повторится
+        на следующем цикле реконсиляции. Не гейт доступа: тег уже назначен отдельно.
+
+        True = чек принят (receipt_sent_at зафиксирован), False = повтор позже."""
+        assert cloudkassir_client is not None
+        oid = order["order_id"]
+        product = cfg.get_product(order["product_id"])
+        name = order["item_name"] or (product.name if product else order["product_id"])
+        res = await cloudkassir_client.send_receipt(
+            order_id=oid,
+            account_id=order["contact_id"],
+            name=name,
+            amount_kopecks=order["amount"],
+            tax_override=(product.tax if product else None),
+            email=order.get("email"),
+            phone=order.get("phone"),
+        )
+        if res.success:
+            database.mark_receipt_sent(oid)
+            log.info(
+                "🧾 Чек CloudKassir принят order=%s id=%s url=%s",
+                oid, res.receipt_id, res.receipt_url,
+            )
+            return True
+        log.error("🧾 Чек CloudKassir не пробит order=%s: %s — повтор позже", oid, res.error)
+        return False
+
+    async def _fiscalize_pending() -> None:
+        """Фоновая задача: периодически пробивает чеки по оплаченным заказам без
+        receipt_sent_at (каналы из cloudkassir.fiscalize_providers). Развязана с
+        webhook/назначением тега — поэтому сбой кассы не теряется и не задерживает
+        выдачу доступа."""
+        assert cfg.cloudkassir is not None
+        interval = cfg.cloudkassir.poll_interval_seconds
+        methods = cfg.cloudkassir_methods()
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                orders = database.get_unfiscalized_orders(
+                    methods, CLOUDKASSIR_MAX_AGE_SECONDS
+                )
+                for order in orders:
+                    try:
+                        await fiscalize_order(order)
+                    except Exception:
+                        log.exception(
+                            "CloudKassir: ошибка фискализации order=%s",
+                            order["order_id"],
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("CloudKassir: ошибка цикла реконсиляции")
 
     # ── создание платежа через прямой Долями ─────────────────────────────────
 
@@ -408,7 +498,7 @@ def create_app(
         tag = cfg.tag_for(req.product_id, effective_method)
         database.create_payment(
             order_id, req.contact_id, req.product_id, effective_method,
-            amount, tag, item_name=item_name,
+            amount, tag, item_name=item_name, email=req.email, phone=req.phone,
         )
         log.info(
             "init-payment: создан платёж order=%s product=%s method=%s amount=%d%s",
