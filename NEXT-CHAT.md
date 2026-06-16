@@ -466,8 +466,8 @@ commit в ЛК Долями (не прокладкой), в 18:28 владеле
    на стороне владельца. Запасной план, если ящик неинформативен: добавить masked-лог
    НАЛИЧИЯ email/phone в `/init-payment` — но это код+деплой, не делалось.)
 
-**16.06.2026 (сессия 3) — CloudKassir: касса для Долями (КОД ГОТОВ, НЕ ЗАДЕПЛОЕН/НЕ
-ЗАКОММИЧЕН, ЖДЁТ БОЕВОЙ ВАЛИДАЦИИ).** Владелец: по карте/СБП чеки идут (касса на стороне
+**16.06.2026 (сессия 3) — CloudKassir: касса для Долями (ЗАДЕПЛОЕНО, PING ПРОЙДЕН,
+ЖДЁТ БОЕВОГО ЗАКАЗА ДЛЯ ВАЛИДАЦИИ СХЕМЫ ЧЕКА).** Владелец: по карте/СБП чеки идут (касса на стороне
 эквайринга Т-Банка), по Долями — нет. Подключаем CloudKassir (CloudPayments KKT,
 `POST api.cloudpayments.ru/kkt/receipt`, Basic Public ID:API Secret) кассой для Долями.
 Реквизиты в `config.yaml` (секреты): `public_id=pk_45fdd72cc3ddb6082e4f23eebeb3b`,
@@ -499,6 +499,23 @@ fallback-email `yayest.community@yandex.ru`.
   авторизацию/связь, без чека; (в) один боевой заказ Долями → в логах `🧾 Чек CloudKassir
   принят`, проверить письмо клиенту, прочитать РЕАЛЬНОЕ тело ответа `/kkt/receipt` (оно
   разрешит развилки Vat/Quantity). Только (в) переводит статус в «verified».
-- Коммит ещё НЕ создан. Файлы изменены: `app/cloudkassir.py` (новый),
-  `app/{config,database,main}.py`, `config.yaml`, `config.example.yaml`, `CLAUDE.md`,
-  `tests/test_cloudkassir.py` (новый).
+- **ЗАДЕПЛОЕНО (16.06).** Коммит `e0fd013` (`9d78f07..e0fd013`) запушен в origin/main
+  (9 файлов; untracked `bnpl-proxy-kit/`/гайды/скриншоты добавлены в `.gitignore` —
+  в коммит не попали). На сервере git pull --ff-only до `e0fd013`, pip ok,
+  `systemctl restart`, миграция `email/phone/receipt_sent_at` + бэкфилл прошли на старте,
+  `/health` ok. Серверный `config.yaml` пропатчен точечно (бэкап
+  `config.yaml.bak-20260616-precloudkassir`): блок `cloudkassir` (enabled, боевые креды,
+  inn, `fiscalize_providers: [dolyame]`, poll 30с) + `dolyame.fiscalization: enabled→disabled`.
+  В логах старта: `CloudKassir: фоновая фискализация каждые 30с (каналы: dolyami)`, ошибок нет.
+- **PING ПРОЙДЕН.** `CloudKassirClient.ping()` (`POST /test`) боевыми кредами →
+  `{'Success': True, 'Message': '<uuid>', 'ErrorCode': None}`. Креды/связь/Basic-авторизация
+  подтверждены (НЕ схема чека — её разрешит только боевой заказ).
+- **ОСТАЛОСЬ (гейт «verified»):** один боевой заказ Долями с пройденным скорингом →
+  в логах ждать `🧾 Чек CloudKassir принят order=... id=...`, проверить письмо клиенту,
+  прочитать РЕАЛЬНОЕ тело ответа `/kkt/receipt`. Если касса отобьёт 4xx — развилки
+  Vat(null vs omit vs код «без НДС») / `Vat` vs `VatRate` / `Quantity` (см. PENDING LIVE
+  VALIDATION в `app/cloudkassir.py`). Лог: `grep -iE 'CloudKassir|🧾' logs/app.log`.
+- **Вопрос по fallback-email:** серверный `receipt.email` = `jwluwelirka@gmail.com` (общий
+  fallback для card/СБП И CloudKassir). Владелец называл чек-email `yayest.community@yandex.ru`.
+  Для реальных заказов email берётся из `/init-payment` (бот), fallback — лишь подстраховка;
+  менять общий `receipt.email` не стали (затронет card/СБП). Уточнить, нужно ли.
