@@ -466,8 +466,8 @@ commit в ЛК Долями (не прокладкой), в 18:28 владеле
    на стороне владельца. Запасной план, если ящик неинформативен: добавить masked-лог
    НАЛИЧИЯ email/phone в `/init-payment` — но это код+деплой, не делалось.)
 
-**16.06.2026 (сессия 3) — CloudKassir: касса для Долями (ЗАДЕПЛОЕНО, PING ПРОЙДЕН,
-ЖДЁТ БОЕВОГО ЗАКАЗА ДЛЯ ВАЛИДАЦИИ СХЕМЫ ЧЕКА).** Владелец: по карте/СБП чеки идут (касса на стороне
+**16.06.2026 (сессия 3) — CloudKassir: касса для Долями (ЗАДЕПЛОЕНО + ВАЛИДИРОВАНО
+БОЕВЫМ ЗАКАЗОМ — ЧЕК УХОДИТ).** Владелец: по карте/СБП чеки идут (касса на стороне
 эквайринга Т-Банка), по Долями — нет. Подключаем CloudKassir (CloudPayments KKT,
 `POST api.cloudpayments.ru/kkt/receipt`, Basic Public ID:API Secret) кассой для Долями.
 Реквизиты в `config.yaml` (секреты): `public_id=pk_45fdd72cc3ddb6082e4f23eebeb3b`,
@@ -510,11 +510,15 @@ fallback-email `yayest.community@yandex.ru`.
 - **PING ПРОЙДЕН.** `CloudKassirClient.ping()` (`POST /test`) боевыми кредами →
   `{'Success': True, 'Message': '<uuid>', 'ErrorCode': None}`. Креды/связь/Basic-авторизация
   подтверждены (НЕ схема чека — её разрешит только боевой заказ).
-- **ОСТАЛОСЬ (гейт «verified»):** один боевой заказ Долями с пройденным скорингом →
-  в логах ждать `🧾 Чек CloudKassir принят order=... id=...`, проверить письмо клиенту,
-  прочитать РЕАЛЬНОЕ тело ответа `/kkt/receipt`. Если касса отобьёт 4xx — развилки
-  Vat(null vs omit vs код «без НДС») / `Vat` vs `VatRate` / `Quantity` (см. PENDING LIVE
-  VALIDATION в `app/cloudkassir.py`). Лог: `grep -iE 'CloudKassir|🧾' logs/app.log`.
+- **ВАЛИДИРОВАНО БОЕВЫМ ЗАКАЗОМ (16.06 09:46 UTC).** Реальный заказ Долями
+  `order=999_2853073_4bd502e0` (100 ₽): create→commit→тег→ через ~14с фоновая
+  реконсиляция → `CloudKassir POST /kkt/receipt OK (HTTP 200) Queued` +
+  `🧾 Чек CloudKassir принят id=cd4ffc84… url=https://receipts.ru/cd4ffc84…`. В БД
+  `receipt_sent_at` проставлен, `email=evgeny.sharonov.now@yandex.ru` (реальная почта
+  покупателя из бота, НЕ fallback). Касса ПРИНЯЛА формат → развилки разрешены: патент
+  `Vat: null` ОК, `Quantity` число ОК, поля PascalCase ОК (не VatRate). Отказов
+  CloudKassir в логах нет. **Остался только финальный штрих:** подтвердить, что письмо
+  физически дошло до покупателя (касса вернула Queued+ссылку — на стороне ОФД).
 - **Вопрос по fallback-email:** серверный `receipt.email` = `jwluwelirka@gmail.com` (общий
   fallback для card/СБП И CloudKassir). Владелец называл чек-email `yayest.community@yandex.ru`.
   Для реальных заказов email берётся из `/init-payment` (бот), fallback — лишь подстраховка;
