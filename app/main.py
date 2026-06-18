@@ -20,6 +20,7 @@ from .cloudkassir import CloudKassirClient
 from .database import Database
 from .dolyame import (
     STATUS_COMMITTED,
+    STATUS_FAIL_TAG as DOLYAME_STATUS_FAIL_TAG,
     STATUS_TERMINAL_NEGATIVE,
     STATUS_WAIT_FOR_COMMIT,
     DolyameClient,
@@ -691,10 +692,21 @@ def create_app(
         # (если задан для способа) как триггер авторассылки «оплата не прошла».
         if info.status in STATUS_TERMINAL_NEGATIVE:
             database.mark_failed(oid, f"Долями статус {info.status}")
-            log.info("webhook Долями: статус %s order=%s — отказ", info.status, oid)
-            fail_tag = cfg.fail_tag_for(order["product_id"], order["payment_method"])
-            if fail_tag and database.capture_fail_tag(oid):
-                await assign_failure_tag(order, fail_tag, attempts=WEBHOOK_TAG_ATTEMPTS)
+            # тег отказа («оплата не прошла») — ТОЛЬКО при реальном отклонении
+            # заявки (rejected). `canceled` = заказ протух/брошен (Долями сам
+            # авто-отменяет неоплаченный заказ ~через 24ч): клиент не платил,
+            # рассылку «оплата не прошла» не запускаем — иначе спамим тех, кто
+            # просто открыл форму и ушёл.
+            if info.status in DOLYAME_STATUS_FAIL_TAG:
+                log.info("webhook Долями: статус %s order=%s — отказ", info.status, oid)
+                fail_tag = cfg.fail_tag_for(order["product_id"], order["payment_method"])
+                if fail_tag and database.capture_fail_tag(oid):
+                    await assign_failure_tag(order, fail_tag, attempts=WEBHOOK_TAG_ATTEMPTS)
+            else:
+                log.info(
+                    "webhook Долями: статус %s order=%s — заказ протух/отменён, "
+                    "тег отказа НЕ ставим", info.status, oid,
+                )
             # best-effort: отказ не блокирует ответ, всегда OK (нет paid_at → нет
             # страховки через /init-payment, Долями может не повторить webhook).
             return PlainTextResponse("OK")

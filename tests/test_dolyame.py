@@ -258,18 +258,32 @@ def test_webhook_rejected_status_fails(env):
 # ── webhook: тег ОТКАЗА (fail_tags_by_method) ────────────────────────────────
 
 
-@pytest.mark.parametrize("neg_status", ["rejected", "canceled"])
-def test_webhook_negative_assigns_fail_tag(env, neg_status):
-    """Терминальный негатив Долями -> назначается тег отказа (не тег успеха)."""
+def test_webhook_rejected_assigns_fail_tag(env):
+    """rejected (реальное отклонение заявки) -> тег отказа (не тег успеха)."""
     order = _init_order(env)
-    env.dolyame.status = neg_status
-    r = _webhook(env, order["order_id"], status=neg_status)
+    env.dolyame.status = "rejected"
+    r = _webhook(env, order["order_id"], status="rejected")
     assert r.status_code == 200 and r.text == "OK"
     row = env.db.get_by_order_id(order["order_id"])
     assert row["status"] == "failed"
     assert row["tag_assigned_at"] is None          # тег успеха НЕ назначен
     assert row["fail_tag_assigned_at"] is not None  # тег отказа назначен
     assert env.shalamo.tag_calls == [("tag", "c1", "fail_dolyami_basic")]
+    assert env.dolyame.commit_calls == []
+
+
+def test_webhook_canceled_does_not_assign_fail_tag(env):
+    """canceled = заказ протух/брошен (авто-отмена Долями ~24ч): доступ не выдаём,
+    но тег «оплата не прошла» НЕ ставим — клиент просто не платил."""
+    order = _init_order(env)
+    env.dolyame.status = "canceled"
+    r = _webhook(env, order["order_id"], status="canceled")
+    assert r.status_code == 200 and r.text == "OK"
+    row = env.db.get_by_order_id(order["order_id"])
+    assert row["status"] == "failed"               # доступ не выдан
+    assert row["tag_assigned_at"] is None           # тег успеха НЕ назначен
+    assert row["fail_tag_assigned_at"] is None      # тег отказа НЕ назначен
+    assert env.shalamo.tag_calls == []              # никакой рассылки
     assert env.dolyame.commit_calls == []
 
 
