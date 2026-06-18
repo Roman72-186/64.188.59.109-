@@ -335,6 +335,53 @@ def test_webhook_rejected_no_tag(tmp_path):
     assert order["status"] == "failed"
 
 
+def test_webhook_rejected_assigns_fail_tag(tmp_path):
+    """rejected (реальное отклонение банком) -> тег отказа (не тег доступа)."""
+    cfg = make_config()
+    raw = cfg.model_dump()
+    raw["products"]["course_basic"]["fail_tags_by_method"]["credit"] = "fail_credit_basic"
+    cfg = AppConfig.model_validate(raw)
+
+    env = _make_env(cfg, tmp_path)
+    order_id = _create_credit_order(env)
+    env.credit.info_status = "rejected"
+
+    r = env.client.post(
+        "/webhook/tbank_credit",
+        json={"orderNumber": order_id, "status": "rejected"},
+    )
+    assert r.status_code == 200
+    order = env.db.get_by_order_id(order_id)
+    assert order["status"] == "failed"
+    assert order["tag_assigned_at"] is None
+    assert order["fail_tag_assigned_at"] is not None
+    assert len(env.shalamo.tag_calls) == 1
+
+
+def test_webhook_canceled_does_not_assign_fail_tag(tmp_path):
+    """canceled = заявка брошена/протухла: доступ не выдаём, но тег «оплата не
+    прошла» НЕ ставим — клиент просто не довёл оформление."""
+    cfg = make_config()
+    raw = cfg.model_dump()
+    raw["products"]["course_basic"]["fail_tags_by_method"]["credit"] = "fail_credit_basic"
+    cfg = AppConfig.model_validate(raw)
+
+    env = _make_env(cfg, tmp_path)
+    order_id = _create_credit_order(env)
+    env.credit.info_status = "canceled"
+
+    r = env.client.post(
+        "/webhook/tbank_credit",
+        json={"orderNumber": order_id, "status": "canceled"},
+    )
+    assert r.status_code == 200
+    order = env.db.get_by_order_id(order_id)
+    assert order["status"] == "failed"
+    assert order["tag_assigned_at"] is None
+    assert order["fail_tag_assigned_at"] is None
+    assert len(env.shalamo.tag_calls) == 0
+
+
 def test_webhook_503_when_info_fails(tmp_path):
     """Если /info недоступен — 503, чтобы Credit Broker повторил webhook."""
     env = _make_env(make_config(), tmp_path)

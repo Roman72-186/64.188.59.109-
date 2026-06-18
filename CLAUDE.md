@@ -156,18 +156,20 @@ venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск;
   получателя обязательны по 54-ФЗ — из `/init-payment` либо fallback `receipt.email/phone`.
 - **Тег отказа (`fail_tags_by_method`)** — отдельный опциональный факт в БД
   (`fail_tag_assigned_at`, `capture_fail_tag`/`mark_fail_tag_assigned` в
-  [app/database.py](app/database.py)): при терминальном негативном статусе у
-  Credit Broker (rejected/canceled) или обычного эквайринга Т-Банка
-  (`NEGATIVE_TBANK_STATUSES` в `/webhook/tbank`: REJECTED/DEADLINE_EXPIRED/CANCELED/
-  AUTH_FAIL) прокладка best-effort назначает тег отказа (триггер авторассылки «оплата
-  не прошла») — не гейт доступа. Если для способа тег не задан в
+  [app/database.py](app/database.py)): при терминальном негативном статусе
+  прокладка best-effort назначает тег отказа (триггер авторассылки «оплата не
+  прошла») — не гейт доступа. У обычного эквайринга Т-Банка это
+  `NEGATIVE_TBANK_STATUSES` в `/webhook/tbank` (REJECTED/DEADLINE_EXPIRED/CANCELED/
+  AUTH_FAIL). Если для способа тег не задан в
   `tags_by_method`/`fail_tags_by_method`, ничего не шлётся (старое поведение).
-  **У Долями тег отказа ставится ТОЛЬКО на `rejected`** (реальное отклонение заявки),
-  но НЕ на `canceled`: `canceled` = заказ протух/брошен (Долями сам авто-отменяет
-  неоплаченный заказ ~через 24ч), клиент просто не платил — слать ему «оплата не
-  прошла» нельзя (спам по тем, кто открыл форму и ушёл). Различение —
-  `STATUS_FAIL_TAG`/`STATUS_TERMINAL_NEGATIVE` в [app/dolyame.py](app/dolyame.py);
-  доступ не выдаём при обоих, тег отказа — только при `rejected`.
+  **У Долями и Credit Broker тег отказа ставится ТОЛЬКО на `rejected`** (реальное
+  отклонение заявки), но НЕ на `canceled`: `canceled` = заявка протухла/брошена
+  (Долями сам авто-отменяет неоплаченный заказ ~через 24ч; у кредита клиент не
+  довёл оформление), клиент просто не платил — слать ему «оплата не прошла» нельзя
+  (спам по тем, кто открыл форму и ушёл). Различение — `STATUS_FAIL_TAG` vs
+  `STATUS_TERMINAL_NEGATIVE` в [app/dolyame.py](app/dolyame.py) и
+  [app/tbank_credit.py](app/tbank_credit.py); доступ не выдаём при обоих статусах,
+  тег отказа — только при `rejected`.
 - **Логи** — `logs/app.log` + stdout; секреты маскируются (`logging_setup.mask_secrets`).
 
 ## Деплой / доступ

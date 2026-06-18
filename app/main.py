@@ -28,6 +28,7 @@ from .dolyame import (
     kopecks_to_rubles,
 )
 from .tbank_credit import (
+    STATUS_FAIL_TAG as CREDIT_STATUS_FAIL_TAG,
     STATUS_SIGNED as CREDIT_STATUS_SIGNED,
     STATUS_TERMINAL_NEGATIVE as CREDIT_STATUS_NEGATIVE,
     TBankCreditClient,
@@ -791,15 +792,27 @@ def create_app(
             return False
         database.set_tbank_status(oid, str(info.status))
 
-        # терминальный негатив — доступ не выдаём; назначаем тег отказа (если задан)
+        # терминальный негатив — доступ не выдаём ни при одном из статусов.
         if info.status in CREDIT_STATUS_NEGATIVE:
             database.mark_failed(oid, f"Credit Broker статус {info.status}")
-            log.info(
-                "%s Credit Broker: статус %s order=%s — отказ", source, info.status, oid
-            )
-            fail_tag = cfg.fail_tag_for(order["product_id"], order["payment_method"])
-            if fail_tag and database.capture_fail_tag(oid):
-                await assign_failure_tag(order, fail_tag, attempts=WEBHOOK_TAG_ATTEMPTS)
+            # тег отказа («оплата не прошла») — ТОЛЬКО при реальном отклонении
+            # заявки банком (rejected). `canceled` = заявка брошена/протухла
+            # (клиент не довёл оформление): рассылку «оплата не прошла» не
+            # запускаем — иначе спамим тех, кто просто открыл форму и ушёл
+            # (та же логика, что у Долями).
+            if info.status in CREDIT_STATUS_FAIL_TAG:
+                log.info(
+                    "%s Credit Broker: статус %s order=%s — отказ",
+                    source, info.status, oid,
+                )
+                fail_tag = cfg.fail_tag_for(order["product_id"], order["payment_method"])
+                if fail_tag and database.capture_fail_tag(oid):
+                    await assign_failure_tag(order, fail_tag, attempts=WEBHOOK_TAG_ATTEMPTS)
+            else:
+                log.info(
+                    "%s Credit Broker: статус %s order=%s — заявка брошена/отменена, "
+                    "тег отказа НЕ ставим", source, info.status, oid,
+                )
             return True
 
         # заявка ещё не подписана — ждём
