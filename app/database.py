@@ -209,6 +209,29 @@ class Database:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    def get_paid_untagged_orders(
+        self, max_age_seconds: int
+    ) -> list[dict[str, Any]]:
+        """Подстраховка (см. инцидент shalamo-401): оплаченные заказы
+        (paid_at IS NOT NULL), по которым тег ещё НЕ назначен (tag_assigned_at IS NULL).
+        Это «оплачено банком, но доступ не выдан» (PRD §7.3) — фоновый реконсилятор
+        добивает их через grant_access, когда shalamo снова доступен. Не зависит от
+        провайдера (любой способ оплаты). `max_age_seconds` отсекает давно
+        заброшенные заказы. Окно считаем по paid_at — это момент, с которого заказ
+        стал «оплачен, но без тега»."""
+        threshold = (
+            datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+        ).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT * FROM payments "
+                "WHERE paid_at IS NOT NULL AND tag_assigned_at IS NULL "
+                "  AND paid_at >= ? "
+                "ORDER BY paid_at ASC",
+                (threshold,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
     def mark_receipt_sent(self, order_id: str) -> None:
         """Чек успешно принят кассой (Queued). Фиксируем receipt_sent_at —
         заказ больше не попадает в get_unfiscalized_orders."""

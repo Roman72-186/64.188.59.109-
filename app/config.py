@@ -94,6 +94,15 @@ class ShalamoConfig(BaseModel):
     assign_tag: ShalamoEndpoint
     # Переменные контакта — best-effort. Если endpoint не задан, шаг пропускается.
     set_variables: ShalamoEndpoint | None = None
+    # Подстраховка (инцидент shalamo-401): фоновый реконсилятор добивает
+    # «оплачено, но тег не назначен». 0 = выключено (как у поллеров провайдеров).
+    reconcile_interval_seconds: float = 0
+    # Окно, за которое реконсилятор подбирает застрявшие заказы (по умолчанию 30 дней,
+    # как CLOUDKASSIR_MAX_AGE_SECONDS / CREDIT_POLL_MAX_AGE_SECONDS).
+    reconcile_max_age_seconds: int = 30 * 24 * 3600
+    # Если оплаченный заказ висит без тега дольше этого порога — CRITICAL в лог
+    # (greppable-сигнал тревоги; push-канал подключается отдельно).
+    stranded_alert_after_seconds: int = 600
 
 
 class TBankCreditConfig(BaseModel):

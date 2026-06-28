@@ -10,6 +10,7 @@ import asyncio
 import ipaddress
 import secrets
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI, Header, Request
@@ -58,6 +59,10 @@ CREDIT_POLL_MAX_AGE_SECONDS = 30 * 24 * 3600
 # Фоновая фискализация CloudKassir: максимальный возраст оплаченного заказа, по
 # которому ещё пытаемся пробить чек (тот же запас, что у опроса Credit Broker).
 CLOUDKASSIR_MAX_AGE_SECONDS = 30 * 24 * 3600
+
+# Реконсилятор тегов (подстраховка, инцидент shalamo-401): одна попытка за цикл —
+# цикл частый, не блокируем его повторами; следующий проход добьёт.
+RECONCILE_TAG_ATTEMPTS = 1
 
 
 def _payment_variables(config: AppConfig, order: dict[str, Any]) -> dict[str, Any]:
@@ -162,6 +167,14 @@ def create_app(
                 ", ".join(cfg.cloudkassir_methods()),
             )
 
+        if cfg.shalamo.reconcile_interval_seconds > 0:
+            bg_tasks.append(asyncio.create_task(_retry_stranded_tags()))
+            log.info(
+                "shalamo: фоновый реконсилятор тегов каждые %.0fс "
+                "(добивает «оплачено, но тег не назначен»)",
+                cfg.shalamo.reconcile_interval_seconds,
+            )
+
         yield
 
         for t in bg_tasks:
@@ -175,6 +188,16 @@ def create_app(
     app = FastAPI(title="TBank ↔ shalamov.io proxy", lifespan=lifespan)
 
     # ── выдача доступа (общий код для webhook и init-payment) ────────────────
+
+    # Сериализует назначение тега между ВСЕМИ путями (webhook, фоновый поллер
+    # кредита, реконсилятор): `atomic_capture` НЕ даёт взаимного исключения между
+    # одновременными назначателями (возвращает True, пока tag_assigned_at IS NULL),
+    # поэтому при восстановлении shalamo webhook-ретрай Т-Банка и реконсилятор могли
+    # бы оба вызвать assign_tag по одному заказу → ДВОЙНАЯ авторассылка (тег
+    # запускает рассылку и удаляется её первым шагом). Лок + повторная проверка
+    # tag_assigned_at под локом это исключают. Один uvicorn-воркер → лок полностью
+    # сериализует критическую секцию.
+    _tag_lock = asyncio.Lock()
 
     async def grant_access(order: dict[str, Any], attempts: int) -> bool:
         """Назначить контакту тег (+ переменные). Тег — гейт доступа: его успешная
@@ -193,14 +216,24 @@ def create_app(
                     "shalamo: переменные не установлены (попытка %d/%d) order=%s: %s",
                     attempt, attempts, order["order_id"], var_res.error,
                 )
-            tag_res = await shalamo_client.assign_tag(contact_id, tag)
-            if tag_res.ok:
-                database.mark_tag_assigned(order["order_id"])
-                log.info(
-                    "✅ Платёж подтверждён order=%s тег=%s contact=%s",
-                    order["order_id"], tag, contact_id,
-                )
-                return True
+            async with _tag_lock:
+                # Повторная проверка под локом: другой путь (webhook-ретрай/реконсилятор)
+                # мог назначить тег, пока мы ждали set_variables — не дёргаем shalamo
+                # второй раз (иначе двойная авторассылка).
+                fresh = database.get_by_order_id(order["order_id"])
+                if fresh and fresh["tag_assigned_at"]:
+                    log.info(
+                        "тег уже назначен параллельно order=%s — пропуск", order["order_id"]
+                    )
+                    return True
+                tag_res = await shalamo_client.assign_tag(contact_id, tag)
+                if tag_res.ok:
+                    database.mark_tag_assigned(order["order_id"])
+                    log.info(
+                        "✅ Платёж подтверждён order=%s тег=%s contact=%s",
+                        order["order_id"], tag, contact_id,
+                    )
+                    return True
             last_error = tag_res.error
             log.error(
                 "❌ Назначение тега не удалось (попытка %d/%d) order=%s: %s",
@@ -305,6 +338,69 @@ def create_app(
                 raise
             except Exception:
                 log.exception("CloudKassir: ошибка цикла реконсиляции")
+
+    # ── подстраховка: реконсилятор «оплачено, но тег не назначен» (shalamo-401) ─
+
+    def _stranded_orders() -> list[dict[str, Any]]:
+        """Оплаченные заказы без тега, висящие дольше stranded_alert_after_seconds.
+        Свежие (только что оплаченные, тег ставится синхронно) сюда НЕ попадают —
+        отсечка по возрасту paid_at убирает ложные срабатывания во время штатного
+        потока. Используется и реконсилятором (CRITICAL-сигнал), и /health."""
+        sh = cfg.shalamo
+        orders = database.get_paid_untagged_orders(sh.reconcile_max_age_seconds)
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=sh.stranded_alert_after_seconds
+        )
+        stuck: list[dict[str, Any]] = []
+        for o in orders:
+            paid = o.get("paid_at")
+            if not paid:
+                continue
+            try:
+                if datetime.fromisoformat(paid) <= cutoff:
+                    stuck.append(o)
+            except ValueError:
+                stuck.append(o)  # нераспарсенная дата — лучше показать, чем спрятать
+        return stuck
+
+    async def _retry_stranded_tags() -> None:
+        """Фоновая задача (подстраховка после инцидента shalamo-401): периодически
+        добивает «оплачено банком, но тег не назначен» через grant_access — ровно то,
+        что иначе делается вручную. Развязана с webhook: если shalamo был недоступен
+        (401/таймаут), такие заказы рассосутся сами, как только он вернётся.
+        Идемпотентно: grant_access → assign_tag (повторный у shalamo = 204) +
+        mark_tag_assigned (COALESCE), гонок с webhook нет.
+
+        Если после прохода остались заказы без тега старше порога —
+        агрегированный CRITICAL в лог (greppable-сигнал тревоги; push-канал
+        подключается отдельно)."""
+        interval = cfg.shalamo.reconcile_interval_seconds
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                orders = database.get_paid_untagged_orders(
+                    cfg.shalamo.reconcile_max_age_seconds
+                )
+                for order in orders:
+                    try:
+                        await grant_access(order, attempts=RECONCILE_TAG_ATTEMPTS)
+                    except Exception:
+                        log.exception(
+                            "Реконсилятор тегов: ошибка order=%s", order["order_id"]
+                        )
+                stuck = _stranded_orders()
+                if stuck:
+                    log.critical(
+                        "СТРАХОВКА: %d оплаченных заказов без тега >%.0fмин — "
+                        "shalamo недоступен? orders=%s",
+                        len(stuck),
+                        cfg.shalamo.stranded_alert_after_seconds / 60,
+                        ", ".join(o["order_id"] for o in stuck[:20]),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Реконсилятор тегов: ошибка цикла")
 
     # ── создание платежа через прямой Долями ─────────────────────────────────
 
@@ -939,7 +1035,13 @@ def create_app(
     # ── /health ──────────────────────────────────────────────────────────────
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
+    async def health() -> dict[str, Any]:
+        # Деградация (подстраховка shalamo-401): если есть оплаченные заказы без тега
+        # старше порога — отдаём degraded + счётчик, чтобы внешний uptime-монитор
+        # увидел проблему без push-инфраструктуры. HTTP всегда 200 (сервис жив).
+        stranded = len(_stranded_orders())
+        if stranded:
+            return {"status": "degraded", "stranded": stranded}
         return {"status": "ok"}
 
     return app

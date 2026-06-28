@@ -61,6 +61,14 @@ venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск;
   импорт модуля для тестов при этом ничего не создаёт.
 - **shalamo — конфиг-адаптер** ([app/shalamo.py](app/shalamo.py)): путь/метод/тело/авторизация
   читаются из конфига. Реальный контракт API неизвестен → правится только `config.yaml`.
+  **Авторизация — `Authorization: Bearer <api_key>`** (`shalamo.auth: in: header`);
+  до 28.06.2026 слали `?api_token=`, shalamo сменил контракт → 401 (см.
+  [docs/incidents/2026-06-28-shalamo-auth-401.md](docs/incidents/2026-06-28-shalamo-auth-401.md)).
+  **Подстраховка от «оплачено, но тег не назначен»:** фоновый реконсилятор
+  `_retry_stranded_tags` ([app/main.py](app/main.py), `shalamo.reconcile_interval_seconds`,
+  0 = выкл) периодически добивает такие заказы через `grant_access` (источник —
+  `database.get_paid_untagged_orders`); при застревании дольше
+  `stranded_alert_after_seconds` — `CRITICAL` в лог и `/health` → `degraded`.
 - **Мульти-терминал (конфиг-driven):** способ оплаты можно вести через отдельный
   магазин Т-Банка (`tbank.extra_terminals` + `payment_methods[*].terminal`) — так форма
   показывает только этот способ (в API Init фильтра способов нет; это уровень терминала).
