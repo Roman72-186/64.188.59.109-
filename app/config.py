@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from typing import Any
 
 import yaml
@@ -392,6 +392,7 @@ class AppConfig(BaseModel):
 
     # ── терминалы (основной + доп. магазины) ────────────────────────────────
 
+    @cached_property
     def resolved_terminals(self) -> dict[str, ResolvedTerminal]:
         """Все терминалы по terminal_key: основной + extra (наследование применено)."""
         out: dict[str, ResolvedTerminal] = {
@@ -424,7 +425,7 @@ class AppConfig(BaseModel):
 
     def password_for_terminal_key(self, terminal_key: str) -> str | None:
         """Пароль терминала по его TerminalKey (для проверки подписи webhook)."""
-        t = self.resolved_terminals().get(terminal_key)
+        t = self.resolved_terminals.get(terminal_key)
         return t.terminal_password if t else None
 
     # ── удобные методы доступа ──────────────────────────────────────────────

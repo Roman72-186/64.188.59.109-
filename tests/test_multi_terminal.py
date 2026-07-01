@@ -45,7 +45,7 @@ def _multiterminal_raw() -> dict:
 
 def test_resolved_terminals_inherit_main_api_url_and_timeout():
     cfg = AppConfig.model_validate(_multiterminal_raw())
-    terminals = cfg.resolved_terminals()
+    terminals = cfg.resolved_terminals
     assert set(terminals) == {"MainKey", "DolyamiKey"}
     dolyami = terminals["DolyamiKey"]
     # api_url/timeout не заданы у доп. терминала -> наследуются от основного
@@ -78,7 +78,7 @@ def test_unknown_terminal_reference_rejected():
 def test_no_extra_terminals_backward_compatible():
     cfg = AppConfig.model_validate(_base_raw())
     assert cfg.terminal_key_for_method("dolyami") == "MainKey"
-    assert list(cfg.resolved_terminals()) == ["MainKey"]
+    assert list(cfg.resolved_terminals) == ["MainKey"]
 
 
 # ── интеграция: webhook доп. магазина подписан своим паролем ─────────────────

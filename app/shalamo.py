@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -91,21 +92,24 @@ class ShalamoClient:
         if body:  # пустое тело не отправляем (query-style API)
             headers["Content-Type"] = "application/json"
             kwargs["json"] = body
+        t0 = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
                 resp = await client.request(
                     endpoint.method.upper(), url, headers=headers, **kwargs
                 )
         except Exception as e:  # сеть/таймаут
-            log.error("shalamo %s: ошибка запроса: %s", op, e)
+            ms = (time.perf_counter() - t0) * 1000
+            log.error("shalamo %s: ошибка запроса (%.0fms): %s", op, ms, e)
             return ShalamoResult(ok=False, error=str(e))
+        ms = (time.perf_counter() - t0) * 1000
 
         if self._is_success(endpoint, resp.status_code):
-            log.info("shalamo %s OK (HTTP %s)", op, resp.status_code)
+            log.info("shalamo %s OK (HTTP %s %.0fms)", op, resp.status_code, ms)
             return ShalamoResult(ok=True, status_code=resp.status_code, raw=resp.text)
 
         log.error(
-            "shalamo %s отказ: HTTP %s body=%s", op, resp.status_code, resp.text[:500]
+            "shalamo %s отказ: HTTP %s body=%s (%.0fms)", op, resp.status_code, resp.text[:500], ms
         )
         return ShalamoResult(
             ok=False,

@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -165,14 +166,17 @@ class CloudKassirClient:
     async def _post(self, path: str, body: dict[str, Any], request_id: str) -> CloudKassirResult:
         url = f"{self.base_url}{path}"
         headers = {"X-Request-ID": request_id}
+        t0 = time.perf_counter()
         try:
             async with httpx.AsyncClient(
                 timeout=self.config.timeout_seconds, auth=self._auth
             ) as client:
                 resp = await client.post(url, headers=headers, json=body)
         except Exception as e:  # сеть/таймаут
-            log.error("CloudKassir POST %s: ошибка запроса: %s", path, e)
+            ms = (time.perf_counter() - t0) * 1000
+            log.error("CloudKassir POST %s: ошибка запроса (%.0fms): %s", path, ms, e)
             return CloudKassirResult(success=False, error=str(e))
+        ms = (time.perf_counter() - t0) * 1000
 
         data: dict[str, Any] = {}
         try:
@@ -184,8 +188,8 @@ class CloudKassirClient:
             model = data.get("Model") or {}
             message = str(data.get("Message") or "")
             log.info(
-                "CloudKassir POST %s OK (HTTP %s) message=%s id=%s",
-                path, resp.status_code, message, model.get("Id"),
+                "CloudKassir POST %s OK (HTTP %s %.0fms) message=%s id=%s",
+                path, resp.status_code, ms, message, model.get("Id"),
             )
             return CloudKassirResult(
                 success=True,
@@ -196,7 +200,7 @@ class CloudKassirClient:
             )
 
         err = str(data.get("Message") or f"HTTP {resp.status_code}")
-        log.error("CloudKassir POST %s отказ: HTTP %s msg=%s", path, resp.status_code, err)
+        log.error("CloudKassir POST %s отказ: HTTP %s msg=%s (%.0fms)", path, resp.status_code, err, ms)
         return CloudKassirResult(success=False, error=err, raw=data)
 
     async def send_receipt(

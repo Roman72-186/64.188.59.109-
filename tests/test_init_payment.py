@@ -91,11 +91,37 @@ def test_amount_override_used_instead_of_config(env):
     assert env.db.get_by_order_id(order_id)["amount"] == 12345
 
 
-def test_amount_omitted_falls_back_to_config(env):
-    r = _post(env, BASIC, token=env.secret)
+def test_amount_string_and_numeric_contact_are_accepted(env):
+    r = _post(
+        env,
+        dict(BASIC, contact_id=12345, amount="9 900", payment_method=" card "),
+        token=env.secret,
+    )
     assert r.status_code == 200
     order_id = r.json()["order_id"]
+    row = env.db.get_by_order_id(order_id)
+    assert row["contact_id"] == "12345"
+    assert row["amount"] == 9900
+    assert env.tbank.init_calls[-1]["amount"] == 9900
+
+
+def test_amount_omitted_falls_back_to_config(env):
+    env.cfg.products["course_basic"].amount = 9900
+    body = dict(BASIC)
+    body.pop("amount")
+    r = _post(env, body, token=env.secret)
+    assert r.status_code == 200
+    order_id = r.json()["order_id"]
+    assert env.tbank.init_calls[-1]["amount"] == 9900
     assert env.db.get_by_order_id(order_id)["amount"] == 9900
+
+
+def test_amount_omitted_without_config_amount_rejected(env):
+    body = dict(BASIC)
+    body.pop("amount")
+    r = _post(env, body, token=env.secret)
+    assert r.status_code == 400
+    assert r.json()["status"] == "invalid_product"
 
 
 def test_force_creates_new_payment_ignoring_active_link(env):

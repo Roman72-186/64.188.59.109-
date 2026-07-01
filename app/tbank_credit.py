@@ -25,6 +25,7 @@ Webhook: webhookURL в Create НЕ передаётся (см. process_credit_st
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Optional
@@ -106,16 +107,19 @@ class TBankCreditClient:
     ) -> CreditResult:
         url = f"{self.base_url}{path}"
         auth = self._auth if use_auth else None
+        t0 = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
                 resp = await client.request(method, url, json=body, auth=auth)
         except Exception as e:
-            log.error("Credit Broker %s %s: ошибка сети: %s", method, path, e)
+            ms = (time.perf_counter() - t0) * 1000
+            log.error("Credit Broker %s %s: ошибка сети (%.0fms): %s", method, path, ms, e)
             return CreditResult(success=False, message=str(e))
+        ms = (time.perf_counter() - t0) * 1000
 
         if 200 <= resp.status_code < 300:
             data = _safe_json(resp)
-            log.info("Credit Broker %s %s OK (HTTP %s)", method, path, resp.status_code)
+            log.info("Credit Broker %s %s OK (HTTP %s %.0fms)", method, path, resp.status_code, ms)
             return CreditResult(
                 success=True,
                 status=data.get("status"),
@@ -128,8 +132,8 @@ class TBankCreditClient:
 
         data = _safe_json(resp)
         log.error(
-            "Credit Broker %s %s отказ: HTTP %s %s",
-            method, path, resp.status_code, data,
+            "Credit Broker %s %s отказ: HTTP %s %s (%.0fms)",
+            method, path, resp.status_code, data, ms,
         )
         return CreditResult(
             success=False,

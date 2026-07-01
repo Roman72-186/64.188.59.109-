@@ -182,6 +182,10 @@ venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск;
 
 ## Деплой / доступ
 
+- При любом обращении пользователя с проблемой по серверу первым шагом проверять сетевую доступность:
+  `ping 64.188.59.109`, TCP-проверки `64.188.59.109:22` и `pay.sushi-house-39.ru:443`,
+  затем `https://pay.sushi-house-39.ru/health`. Если сеть недоступна, сначала сообщить об этом,
+  а уже потом разбирать код, systemd, nginx и логи.
 - VPS, systemd, nginx+HTTPS — [deploy/](deploy/) и [DOCS.md §4–§7](DOCS.md).
 - SSH к серверу `64.188.59.109` — [deploy/ssh-access.md](deploy/ssh-access.md).
   Важно: Windows-OpenSSH к серверу не цепляется (KEX) — рабочий клиент `plink` (PuTTY).

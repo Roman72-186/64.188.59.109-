@@ -74,7 +74,6 @@ class Database:
         conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=10000")
             conn.execute("PRAGMA foreign_keys=ON")
             yield conn
@@ -87,6 +86,7 @@ class Database:
 
     def init_db(self) -> None:
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
             self._migrate(conn)
 
@@ -317,7 +317,7 @@ class Database:
         with self._connect() as conn:
             conn.execute(
                 "UPDATE payments SET status = 'failed', last_error = ?, "
-                "updated_at = ? WHERE order_id = ?",
+                "updated_at = ? WHERE order_id = ? AND status != 'confirmed'",
                 (error, _utcnow(), order_id),
             )
 
