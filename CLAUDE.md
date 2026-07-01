@@ -40,7 +40,7 @@ forma.tbank.ru) → клиент подписывает документы (`sig
 venv\Scripts\pip install -r requirements.txt        # Windows
 cp config.example.yaml config.yaml                  # заполнить ключи + secret_token
 
-venv\Scripts\python -m pytest -q                    # 96 тестов: unit + интеграционные
+venv\Scripts\python -m pytest -q                    # 126 тестов: unit + интеграционные
 venv\Scripts\python test_flow.py                    # автономный прогон потока на моках
 venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск; GET /health -> {"status":"ok"}
 ```
@@ -182,11 +182,27 @@ venv\Scripts\uvicorn app.main:create_app --factory --port 8000   # запуск;
 
 ## Деплой / доступ
 
+- **Сервер (актуальный, с 01.07.2026): `72.56.8.174`.** Старый `64.188.59.109`
+  выведен из эксплуатации после миграции — не путать при чтении старых
+  хэндоффов/скриншотов, там ещё встречается прежний IP. DNS `pay.sushi-house-39.ru`
+  уже указывает на новый сервер.
 - При любом обращении пользователя с проблемой по серверу первым шагом проверять сетевую доступность:
-  `ping 64.188.59.109`, TCP-проверки `64.188.59.109:22` и `pay.sushi-house-39.ru:443`,
+  `ping 72.56.8.174`, TCP-проверки `72.56.8.174:22` и `pay.sushi-house-39.ru:443`,
   затем `https://pay.sushi-house-39.ru/health`. Если сеть недоступна, сначала сообщить об этом,
   а уже потом разбирать код, systemd, nginx и логи.
 - VPS, systemd, nginx+HTTPS — [deploy/](deploy/) и [DOCS.md §4–§7](DOCS.md).
-- SSH к серверу `64.188.59.109` — [deploy/ssh-access.md](deploy/ssh-access.md).
-  Важно: Windows-OpenSSH к серверу не цепляется (KEX) — рабочий клиент `plink` (PuTTY).
+- SSH к серверу `72.56.8.174` — [deploy/ssh-access.md](deploy/ssh-access.md).
+  В отличие от старого сервера, к новому обычный Windows-OpenSSH (`ssh`/`scp`)
+  подключается без проблем (KEX-инцидент был специфичен для старого хоста);
+  `plink`/`pscp` тоже работают. Вход по ключу (`~/.ssh/tbank_proxy_deploy`) уже настроен.
+- **Известная проблема после миграции (частично исправлено 01.07.2026):** `/opt/tbank_proxy`
+  на новом сервере — git-репозиторий БЕЗ единого коммита (`git init` + `git add -A` поверх
+  скопированных файлов, а не `git clone`/`git pull`) — `git log`/`git pull`/`git reset --hard
+  origin/...` там не сработают, пока история не будет восстановлена. `app/schemas.py` был
+  устаревшим (снова `Optional[int]` для `amount`, без валидаторов нормализации входа) —
+  исправлен точечной заливкой файла и рестартом сервиса; остальной код (`main.py`, `dolyame.py`,
+  `tbank_credit.py`, `config.py`, `database.py`, `cloudkassir.py`, `shalamo.py`, `tbank.py`,
+  `logging_setup.py`) совпадает с последним коммитом ветки. Не хватает (не критично для рантайма):
+  `tests/test_reconcile.py`, `docs/incidents/2026-06-28-shalamo-auth-401.md`, актуальных
+  `CLAUDE.md`/`DOCS.md`/`config.example.yaml`/`deploy/nginx.conf.example`/`deploy/tbank-proxy.service`.
 - Секреты — в `config.yaml` и `.env` (оба в `.gitignore`, в репозиторий не коммитятся).

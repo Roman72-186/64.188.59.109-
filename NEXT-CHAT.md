@@ -11,10 +11,12 @@
 ```
 Контекст: прокладка-платёжка (Python 3.10+ / FastAPI / SQLite) между провайдерами
 (Т-Банк эквайринг card/sbp, Долями, T-Bank Credit Broker рассрочка) и shalamov.io.
-Рабочая папка открыта (git, ветка main). Сервер 64.188.59.109, systemd-сервис
-tbank-proxy.service, код в /opt/tbank_proxy, доступ — plink/pscp (см.
-deploy/ssh-access.md, пароль в .env → SSH_PASSWORD; Windows-OpenSSH к серверу НЕ
-цепляется, только PuTTY plink). venv на CPython 3.12.
+Рабочая папка открыта (git, ветка fix/shalamo-401-tag-reconciler). Сервер (с 01.07.2026,
+после миграции) — 72.56.8.174, systemd-сервис tbank-proxy.service, код в /opt/tbank_proxy,
+доступ — обычный ssh/scp работает напрямую (ключ ~/.ssh/tbank_proxy_deploy) ИЛИ plink/pscp
+(см. deploy/ssh-access.md, пароль в .env → SSH_PASSWORD). Старый сервер 64.188.59.109
+выведен из эксплуатации — не путать при чтении записей ниже (там ещё старый IP). venv на
+CPython 3.12.
 Тесты: venv\Scripts\python -m pytest tests -q -p no:cacheprovider --import-mode=importlib
 (103 passed; без --import-mode сборщик падает на кириллическом пути — это не баг кода).
 
@@ -77,6 +79,30 @@ app/dolyame.py, app/main.py (init-payment ~428, init_credit_payment ~259, webhoo
 ---
 
 ## Уточнения (дописывать сюда по мере появления)
+
+- **01.07.2026 — МИГРАЦИЯ НА НОВЫЙ СЕРВЕР `72.56.8.174`** (старый `64.188.59.109`
+  выведен из эксплуатации). DNS `pay.sushi-house-39.ru` уже указывает на новый IP,
+  TLS (Let's Encrypt) и nginx настроены, `tbank-proxy.service` активен, `/health` ok.
+  Host key нового сервера, пароль — обновлены в `.env`/`deploy/ssh-access.md`.
+  К новому серверу (в отличие от старого) обычный Windows-OpenSSH подключается без
+  проблем; ключевой вход настроен (`~/.ssh/tbank_proxy_deploy` добавлен в
+  `authorized_keys`).
+  **Найдено и исправлено:** `app/schemas.py` на новом сервере был устаревшим —
+  `amount` снова `Optional[int]` и отсутствовали валидаторы нормализации входа
+  (`_normalize_contact_id`/`_strip_lookup_fields`/`_normalize_amount`), хотя
+  `app/main.py` и остальной код уже соответствовали последнему коммиту ветки
+  `fix/shalamo-401-tag-reconciler` (`54e0a82`). Залит правильный файл (бэкап в
+  `/opt/tbank_proxy/_backup/20260701-schemas/`), сервис перезапущен, `/health` ok,
+  логи чистые.
+  **НЕ исправлено (осталось на будущее):** `/opt/tbank_proxy` на сервере — git-репо
+  БЕЗ единого коммита (`git init`+`git add -A` поверх скопированных файлов вместо
+  `git clone`/`git pull` от origin) — `git log`/`git pull`/`git reset --hard
+  origin/...` не сработают, пока история не восстановлена (нужно решить: либо
+  закоммитить текущее состояние как baseline, либо чистый re-deploy через
+  `git clone`). Также отсутствуют (не критично для рантайма): `tests/test_reconcile.py`,
+  `docs/incidents/2026-06-28-shalamo-auth-401.md`, актуальные `CLAUDE.md`/`DOCS.md`/
+  `config.example.yaml`/`deploy/nginx.conf.example`/`deploy/tbank-proxy.service`
+  (шаблоны — не проверено, расходятся ли с реально применённым nginx/systemd-юнитом).
 
 - **08.06.2026 — ДЕПЛОЙ ВЫПОЛНЕН.** Код на сервере (58 тестов), сертификат mTLS в
   `/opt/tbank_proxy/certs/` (www-data, key 600), серверный `config.yaml` — абсолютные
