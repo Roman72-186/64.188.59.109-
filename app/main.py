@@ -688,8 +688,13 @@ def create_app(
                 )
                 effective_method = credit_method
 
-        # 4. товар уже оплачен (PRD §7.3)
-        paid = database.find_paid_order(req.contact_id, req.product_id)
+        # 4. товар уже оплачен (PRD §7.3). force=True означает новое оформление:
+        #    ранее успешная оплата не должна блокировать повторную покупку.
+        paid = (
+            None
+            if req.force
+            else database.find_paid_order(req.contact_id, req.product_id)
+        )
         if paid is not None:
             if paid["tag_assigned_at"]:
                 log.info(
