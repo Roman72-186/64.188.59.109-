@@ -44,10 +44,10 @@ shalamo:
   # timeout_seconds * 2 должно укладываться в таймаут webhook Т-Банка (~10с).
   timeout_seconds: 3
   auth:
-    in: "query"                  # ключ уходит как ?api_token=...
-    param: "api_token"
-    value_template: "{api_key}"
-  # POST /attachTagToContact?api_token=...&contact_id=...&name=<тег>
+    in: "header"                 # ключ уходит заголовком Authorization: Bearer <api_key>
+    header: "Authorization"      # (shalamo сменил контракт 28.06.2026 — был ?api_token=)
+    value_template: "Bearer {api_key}"
+  # POST /attachTagToContact?contact_id=...&name=<тег> (+ Authorization: Bearer)
   assign_tag:
     method: "POST"
     path: "/attachTagToContact"
@@ -66,6 +66,12 @@ shalamo:
   #     name: "{variables}"
   #   success_when:
   #     http_2xx: true
+  # Подстраховка (инцидент shalamo-401, 28.06.2026): фоновый реконсилятор добивает
+  # «оплачено банком, но тег не назначен» (например, когда shalamo временно недоступен
+  # или сменил контракт). 0 = выключено. Боевое значение — напр. 120 (раз в 2 мин).
+  reconcile_interval_seconds: 0
+  reconcile_max_age_seconds: 2592000   # окно подбора застрявших, сек (30 дней)
+  stranded_alert_after_seconds: 600    # заказ без тега дольше этого -> CRITICAL + /health degraded
 
 # ── Чек 54-ФЗ (Receipt) ─────────────────────────────────────────────────────
 # Боевой терминал с подключённой кассой ТРЕБУЕТ Receipt в Init, иначе ошибка

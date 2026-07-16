@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from typing import Any
 
 import yaml
@@ -94,6 +94,15 @@ class ShalamoConfig(BaseModel):
     assign_tag: ShalamoEndpoint
     # Переменные контакта — best-effort. Если endpoint не задан, шаг пропускается.
     set_variables: ShalamoEndpoint | None = None
+    # Подстраховка (инцидент shalamo-401): фоновый реконсилятор добивает
+    # «оплачено, но тег не назначен». 0 = выключено (как у поллеров провайдеров).
+    reconcile_interval_seconds: float = 0
+    # Окно, за которое реконсилятор подбирает застрявшие заказы (по умолчанию 30 дней,
+    # как CLOUDKASSIR_MAX_AGE_SECONDS / CREDIT_POLL_MAX_AGE_SECONDS).
+    reconcile_max_age_seconds: int = 30 * 24 * 3600
+    # Если оплаченный заказ висит без тега дольше этого порога — CRITICAL в лог
+    # (greppable-сигнал тревоги; push-канал подключается отдельно).
+    stranded_alert_after_seconds: int = 600
 
 
 class TBankCreditConfig(BaseModel):
@@ -383,6 +392,7 @@ class AppConfig(BaseModel):
 
     # ── терминалы (основной + доп. магазины) ────────────────────────────────
 
+    @cached_property
     def resolved_terminals(self) -> dict[str, ResolvedTerminal]:
         """Все терминалы по terminal_key: основной + extra (наследование применено)."""
         out: dict[str, ResolvedTerminal] = {
@@ -415,7 +425,7 @@ class AppConfig(BaseModel):
 
     def password_for_terminal_key(self, terminal_key: str) -> str | None:
         """Пароль терминала по его TerminalKey (для проверки подписи webhook)."""
-        t = self.resolved_terminals().get(terminal_key)
+        t = self.resolved_terminals.get(terminal_key)
         return t.terminal_password if t else None
 
     # ── удобные методы доступа ──────────────────────────────────────────────

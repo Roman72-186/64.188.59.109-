@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class InitStatus(str, Enum):
@@ -34,11 +34,44 @@ class InitPaymentRequest(BaseModel):
     # Опционально переопределяет сумму товара из config.yaml (в копейках). Запрос
     # идёт по секретному токену от доверенной платформы (shalamov.io/бот) — конечный
     # клиент его не видит и подменить сумму не может.
-    amount: int = Field(gt=0, description="сумма в копейках — формируется платформой")
-    force: bool = Field(default=False, description="пропустить проверку активной ссылки и создать новый платёж")
+    amount: Optional[int] = Field(default=None, gt=0, description="сумма в копейках — формируется платформой")
+    force: bool = Field(
+        default=False,
+        description="начать новое оформление: не учитывать прежнюю оплату и активную ссылку",
+    )
     # Контакт для чека 54-ФЗ (опционально; иначе берётся fallback из config.receipt)
     email: Optional[str] = Field(default=None, description="email покупателя для чека")
     phone: Optional[str] = Field(default=None, description="телефон покупателя для чека")
+
+
+    @field_validator("contact_id", mode="before")
+    @classmethod
+    def _normalize_contact_id(cls, value: Any) -> Any:
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("product_id", "payment_method", mode="before")
+    @classmethod
+    def _strip_lookup_fields(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _normalize_amount(cls, value: Any) -> Any:
+        if value is None or isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            normalized = value.strip().replace(" ", "").replace("\u00a0", "")
+            if normalized.isdecimal():
+                return int(normalized)
+        return value
 
 
 class InitPaymentResponse(BaseModel):

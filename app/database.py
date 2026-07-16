@@ -74,7 +74,6 @@ class Database:
         conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=10000")
             conn.execute("PRAGMA foreign_keys=ON")
             yield conn
@@ -87,6 +86,7 @@ class Database:
 
     def init_db(self) -> None:
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
             self._migrate(conn)
 
@@ -209,6 +209,29 @@ class Database:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    def get_paid_untagged_orders(
+        self, max_age_seconds: int
+    ) -> list[dict[str, Any]]:
+        """Подстраховка (см. инцидент shalamo-401): оплаченные заказы
+        (paid_at IS NOT NULL), по которым тег ещё НЕ назначен (tag_assigned_at IS NULL).
+        Это «оплачено банком, но доступ не выдан» (PRD §7.3) — фоновый реконсилятор
+        добивает их через grant_access, когда shalamo снова доступен. Не зависит от
+        провайдера (любой способ оплаты). `max_age_seconds` отсекает давно
+        заброшенные заказы. Окно считаем по paid_at — это момент, с которого заказ
+        стал «оплачен, но без тега»."""
+        threshold = (
+            datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+        ).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT * FROM payments "
+                "WHERE paid_at IS NOT NULL AND tag_assigned_at IS NULL "
+                "  AND paid_at >= ? "
+                "ORDER BY paid_at ASC",
+                (threshold,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
     def mark_receipt_sent(self, order_id: str) -> None:
         """Чек успешно принят кассой (Queued). Фиксируем receipt_sent_at —
         заказ больше не попадает в get_unfiscalized_orders."""
@@ -294,7 +317,7 @@ class Database:
         with self._connect() as conn:
             conn.execute(
                 "UPDATE payments SET status = 'failed', last_error = ?, "
-                "updated_at = ? WHERE order_id = ?",
+                "updated_at = ? WHERE order_id = ? AND status != 'confirmed'",
                 (error, _utcnow(), order_id),
             )
 

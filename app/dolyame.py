@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
@@ -130,6 +131,7 @@ class DolyameClient:
         for attempt in range(1, MAX_RETRY_429 + 2):
             correlation_id = str(uuid.uuid4())
             headers = {"X-Correlation-ID": correlation_id}
+            t0 = time.perf_counter()
             try:
                 async with httpx.AsyncClient(
                     timeout=self.config.timeout_seconds,
@@ -140,34 +142,36 @@ class DolyameClient:
                         method, url, headers=headers, json=body
                     )
             except Exception as e:  # сеть/таймаут/TLS
-                log.error("Долями %s %s: ошибка запроса: %s", method, path, e)
+                ms = (time.perf_counter() - t0) * 1000
+                log.error("Долями %s %s: ошибка запроса (%.0fms): %s", method, path, ms, e)
                 return DolyameResult(
                     success=False, correlation_id=correlation_id, message=str(e)
                 )
+            ms = (time.perf_counter() - t0) * 1000
 
             if 200 <= resp.status_code < 300:
                 data = _safe_json(resp)
                 log.info(
-                    "Долями %s %s OK (HTTP %s) cid=%s",
-                    method, path, resp.status_code, correlation_id,
+                    "Долями %s %s OK (HTTP %s %.0fms) cid=%s",
+                    method, path, resp.status_code, ms, correlation_id,
                 )
                 return _order_info_result(correlation_id, data)
 
-            # 429 — уважаем X-Retry-After и повторяем
+            # 429 — уважаем X-Retry-After и повторяем (sleep не входит в тайминг)
             if resp.status_code == 429 and attempt <= MAX_RETRY_429:
                 retry_after = _parse_retry_after(resp)
                 log.warning(
-                    "Долями %s %s: 429, повтор через %.1fs (попытка %d) cid=%s",
-                    method, path, retry_after, attempt, correlation_id,
+                    "Долями %s %s: 429, повтор через %.1fs (попытка %d, %.0fms) cid=%s",
+                    method, path, retry_after, attempt, ms, correlation_id,
                 )
                 await asyncio.sleep(retry_after)
                 continue
 
             last = _error_result(correlation_id, resp)
             log.error(
-                "Долями %s %s отказ: HTTP %s code=%s msg=%s cid=%s",
+                "Долями %s %s отказ: HTTP %s code=%s msg=%s (%.0fms) cid=%s",
                 method, path, resp.status_code, last.error_code, last.message,
-                correlation_id,
+                ms, correlation_id,
             )
             return last
 

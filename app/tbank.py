@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -116,19 +117,23 @@ class TBankClient:
             params["Receipt"] = receipt
 
         body = self._signed(params)
+        t0 = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 resp = await client.post(f"{self.api_url}/Init", json=body)
             data = resp.json()
         except Exception as e:  # сеть/таймаут/невалидный JSON
-            log.error("Т-Банк Init: ошибка запроса order=%s: %s", order_id, e)
+            ms = (time.perf_counter() - t0) * 1000
+            log.error("Т-Банк Init: ошибка запроса order=%s (%.0fms): %s", order_id, ms, e)
             return InitResult(success=False, message=str(e))
+        ms = (time.perf_counter() - t0) * 1000
 
         if data.get("Success"):
             log.info(
-                "Т-Банк Init OK order=%s payment_id=%s",
+                "Т-Банк Init OK order=%s payment_id=%s (%.0fms)",
                 order_id,
                 data.get("PaymentId"),
+                ms,
             )
             return InitResult(
                 success=True,
@@ -137,10 +142,11 @@ class TBankClient:
                 raw=data,
             )
         log.error(
-            "Т-Банк Init отказ order=%s code=%s msg=%s",
+            "Т-Банк Init отказ order=%s code=%s msg=%s (%.0fms)",
             order_id,
             data.get("ErrorCode"),
             data.get("Message"),
+            ms,
         )
         return InitResult(
             success=False,
@@ -153,21 +159,26 @@ class TBankClient:
         """Запросить состояние платежа (POST /GetState) — PRD §7.6."""
         params = {"TerminalKey": self.terminal_key, "PaymentId": str(payment_id)}
         body = self._signed(params)
+        t0 = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 resp = await client.post(f"{self.api_url}/GetState", json=body)
             data = resp.json()
         except Exception as e:
-            log.error("Т-Банк GetState: ошибка запроса payment_id=%s: %s", payment_id, e)
+            ms = (time.perf_counter() - t0) * 1000
+            log.error("Т-Банк GetState: ошибка запроса payment_id=%s (%.0fms): %s", payment_id, ms, e)
             return StateResult(success=False, error_code=str(e))
+        ms = (time.perf_counter() - t0) * 1000
 
         if data.get("Success"):
+            log.info("Т-Банк GetState OK payment_id=%s status=%s (%.0fms)", payment_id, data.get("Status"), ms)
             return StateResult(
                 success=True,
                 status=data.get("Status"),
                 amount=data.get("Amount"),
                 raw=data,
             )
+        log.error("Т-Банк GetState отказ payment_id=%s code=%s (%.0fms)", payment_id, data.get("ErrorCode"), ms)
         return StateResult(
             success=False, error_code=data.get("ErrorCode"), raw=data
         )

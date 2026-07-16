@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import secrets
+import time
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI, Header, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .config import AppConfig, get_config
@@ -34,7 +39,7 @@ from .tbank_credit import (
     TBankCreditClient,
     build_credit_item,
 )
-from .logging_setup import get_logger, setup_logging
+from .logging_setup import get_logger, mask_secrets, set_request_id, setup_logging
 from .schemas import InitPaymentRequest, InitPaymentResponse, InitStatus
 from .shalamo import ShalamoClient
 from .tbank import TBankClient, verify_webhook_token
@@ -58,6 +63,10 @@ CREDIT_POLL_MAX_AGE_SECONDS = 30 * 24 * 3600
 # Фоновая фискализация CloudKassir: максимальный возраст оплаченного заказа, по
 # которому ещё пытаемся пробить чек (тот же запас, что у опроса Credit Broker).
 CLOUDKASSIR_MAX_AGE_SECONDS = 30 * 24 * 3600
+
+# Реконсилятор тегов (подстраховка, инцидент shalamo-401): одна попытка за цикл —
+# цикл частый, не блокируем его повторами; следующий проход добьёт.
+RECONCILE_TAG_ATTEMPTS = 1
 
 
 def _payment_variables(config: AppConfig, order: dict[str, Any]) -> dict[str, Any]:
@@ -126,7 +135,7 @@ def create_app(
                 api_url=t.api_url,
                 timeout_seconds=t.timeout_seconds,
             )
-            for t in cfg.resolved_terminals().values()
+            for t in cfg.resolved_terminals.values()
         }
 
         def client_for_method(method: str) -> Any:
@@ -162,6 +171,14 @@ def create_app(
                 ", ".join(cfg.cloudkassir_methods()),
             )
 
+        if cfg.shalamo.reconcile_interval_seconds > 0:
+            bg_tasks.append(asyncio.create_task(_retry_stranded_tags()))
+            log.info(
+                "shalamo: фоновый реконсилятор тегов каждые %.0fс "
+                "(добивает «оплачено, но тег не назначен»)",
+                cfg.shalamo.reconcile_interval_seconds,
+            )
+
         yield
 
         for t in bg_tasks:
@@ -174,7 +191,80 @@ def create_app(
 
     app = FastAPI(title="TBank ↔ shalamov.io proxy", lifespan=lifespan)
 
+    # ── метрики сессии ────────────────────────────────────────────────────────
+    # Инициализируются здесь (не в lifespan), чтобы /health работал даже в тестах,
+    # которые не запускают lifespan (env.client без контекст-менеджера).
+    _start_time: float = time.monotonic()
+    metrics: dict[str, Any] = {
+        "tags_granted": 0,
+        "last_reconcile_run": None,
+        "last_poll_run": None,
+        "last_fiscalize_run": None,
+    }
+
+    # ── request ID middleware (raw ASGI) ─────────────────────────────────────
+    # Используем raw ASGI middleware (не BaseHTTPMiddleware), потому что
+    # BaseHTTPMiddleware обёртывает call_next в отдельный Task, из-за чего
+    # contextvars не гарантированно пробрасываются в endpoint (зависит от
+    # версии Starlette). Чистый ASGI-вызов наследует contextvars напрямую.
+    class _RequestIdMiddleware:
+        def __init__(self, asgi_app: Any) -> None:
+            self._app = asgi_app
+
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            if scope["type"] in ("http", "websocket"):
+                rid = str(uuid.uuid4())[:8]
+                set_request_id(rid)
+            await self._app(scope, receive, send)
+
+    app.add_middleware(_RequestIdMiddleware)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        """Логируем ошибки входного JSON без секретов и значений полей."""
+        content_type = request.headers.get("content-type", "")
+        try:
+            raw_body = await request.body()
+            parsed = json.loads(raw_body) if raw_body else None
+            if isinstance(parsed, dict):
+                safe_body_shape: Any = {
+                    k: type(v).__name__
+                    for k, v in mask_secrets(parsed).items()
+                }
+            elif isinstance(parsed, list):
+                safe_body_shape = f"list[{len(parsed)}]"
+            else:
+                safe_body_shape = type(parsed).__name__
+        except Exception:
+            safe_body_shape = "non-json-or-unreadable"
+
+        safe_errors = [
+            {k: v for k, v in err.items() if k != "input"}
+            for err in exc.errors()
+        ]
+        log.warning(
+            "validation: %s %s content_type=%s body_shape=%s errors=%s",
+            request.method,
+            request.url.path,
+            content_type,
+            safe_body_shape,
+            safe_errors,
+        )
+        return JSONResponse(status_code=422, content={"detail": safe_errors})
+
     # ── выдача доступа (общий код для webhook и init-payment) ────────────────
+
+    # Сериализует назначение тега между ВСЕМИ путями (webhook, фоновый поллер
+    # кредита, реконсилятор): `atomic_capture` НЕ даёт взаимного исключения между
+    # одновременными назначателями (возвращает True, пока tag_assigned_at IS NULL),
+    # поэтому при восстановлении shalamo webhook-ретрай Т-Банка и реконсилятор могли
+    # бы оба вызвать assign_tag по одному заказу → ДВОЙНАЯ авторассылка (тег
+    # запускает рассылку и удаляется её первым шагом). Лок + повторная проверка
+    # tag_assigned_at под локом это исключают. Один uvicorn-воркер → лок полностью
+    # сериализует критическую секцию.
+    _tag_lock = asyncio.Lock()
 
     async def grant_access(order: dict[str, Any], attempts: int) -> bool:
         """Назначить контакту тег (+ переменные). Тег — гейт доступа: его успешная
@@ -193,14 +283,25 @@ def create_app(
                     "shalamo: переменные не установлены (попытка %d/%d) order=%s: %s",
                     attempt, attempts, order["order_id"], var_res.error,
                 )
-            tag_res = await shalamo_client.assign_tag(contact_id, tag)
-            if tag_res.ok:
-                database.mark_tag_assigned(order["order_id"])
-                log.info(
-                    "✅ Платёж подтверждён order=%s тег=%s contact=%s",
-                    order["order_id"], tag, contact_id,
-                )
-                return True
+            async with _tag_lock:
+                # Повторная проверка под локом: другой путь (webhook-ретрай/реконсилятор)
+                # мог назначить тег, пока мы ждали set_variables — не дёргаем shalamo
+                # второй раз (иначе двойная авторассылка).
+                fresh = database.get_by_order_id(order["order_id"])
+                if fresh and fresh["tag_assigned_at"]:
+                    log.info(
+                        "тег уже назначен параллельно order=%s — пропуск", order["order_id"]
+                    )
+                    return True
+                tag_res = await shalamo_client.assign_tag(contact_id, tag)
+                if tag_res.ok:
+                    database.mark_tag_assigned(order["order_id"])
+                    metrics["tags_granted"] += 1
+                    log.info(
+                        "✅ Платёж подтверждён order=%s тег=%s contact=%s",
+                        order["order_id"], tag, contact_id,
+                    )
+                    return True
             last_error = tag_res.error
             log.error(
                 "❌ Назначение тега не удалось (попытка %d/%d) order=%s: %s",
@@ -289,22 +390,115 @@ def create_app(
         methods = cfg.cloudkassir_methods()
         while True:
             await asyncio.sleep(interval)
+            set_request_id(f"fiscalize-{str(uuid.uuid4())[:8]}")
             try:
                 orders = database.get_unfiscalized_orders(
                     methods, CLOUDKASSIR_MAX_AGE_SECONDS
                 )
+                total = len(orders)
+                ok_count = err_count = 0
                 for order in orders:
                     try:
-                        await fiscalize_order(order)
+                        if await fiscalize_order(order):
+                            ok_count += 1
+                        else:
+                            err_count += 1
                     except Exception:
+                        err_count += 1
                         log.exception(
                             "CloudKassir: ошибка фискализации order=%s",
                             order["order_id"],
                         )
+                metrics["last_fiscalize_run"] = datetime.now(timezone.utc).isoformat()
+                if total > 0:
+                    log.info(
+                        "CloudKassir фискализация: обработано=%d успешно=%d ошибок=%d",
+                        total, ok_count, err_count,
+                    )
+                else:
+                    log.debug("CloudKassir фискализация: нет заказов для пробивки")
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("CloudKassir: ошибка цикла реконсиляции")
+
+    # ── подстраховка: реконсилятор «оплачено, но тег не назначен» (shalamo-401) ─
+
+    def _stranded_orders() -> list[dict[str, Any]]:
+        """Оплаченные заказы без тега, висящие дольше stranded_alert_after_seconds.
+        Свежие (только что оплаченные, тег ставится синхронно) сюда НЕ попадают —
+        отсечка по возрасту paid_at убирает ложные срабатывания во время штатного
+        потока. Используется и реконсилятором (CRITICAL-сигнал), и /health."""
+        sh = cfg.shalamo
+        orders = database.get_paid_untagged_orders(sh.reconcile_max_age_seconds)
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=sh.stranded_alert_after_seconds
+        )
+        stuck: list[dict[str, Any]] = []
+        for o in orders:
+            paid = o.get("paid_at")
+            if not paid:
+                continue
+            try:
+                if datetime.fromisoformat(paid) <= cutoff:
+                    stuck.append(o)
+            except ValueError:
+                stuck.append(o)  # нераспарсенная дата — лучше показать, чем спрятать
+        return stuck
+
+    async def _retry_stranded_tags() -> None:
+        """Фоновая задача (подстраховка после инцидента shalamo-401): периодически
+        добивает «оплачено банком, но тег не назначен» через grant_access — ровно то,
+        что иначе делается вручную. Развязана с webhook: если shalamo был недоступен
+        (401/таймаут), такие заказы рассосутся сами, как только он вернётся.
+        Идемпотентно: grant_access → assign_tag (повторный у shalamo = 204) +
+        mark_tag_assigned (COALESCE), гонок с webhook нет.
+
+        Если после прохода остались заказы без тега старше порога —
+        агрегированный CRITICAL в лог (greppable-сигнал тревоги; push-канал
+        подключается отдельно)."""
+        interval = cfg.shalamo.reconcile_interval_seconds
+        while True:
+            await asyncio.sleep(interval)
+            set_request_id(f"reconcile-{str(uuid.uuid4())[:8]}")
+            try:
+                orders = database.get_paid_untagged_orders(
+                    cfg.shalamo.reconcile_max_age_seconds
+                )
+                total = len(orders)
+                ok_count = err_count = 0
+                for order in orders:
+                    try:
+                        if await grant_access(order, attempts=RECONCILE_TAG_ATTEMPTS):
+                            ok_count += 1
+                        else:
+                            err_count += 1
+                    except Exception:
+                        err_count += 1
+                        log.exception(
+                            "Реконсилятор тегов: ошибка order=%s", order["order_id"]
+                        )
+                metrics["last_reconcile_run"] = datetime.now(timezone.utc).isoformat()
+                if total > 0:
+                    log.info(
+                        "Реконсилятор тегов: обработано=%d успешно=%d ошибок=%d",
+                        total, ok_count, err_count,
+                    )
+                else:
+                    log.debug("Реконсилятор тегов: застрявших заказов нет")
+                stuck = _stranded_orders()
+                if stuck:
+                    log.critical(
+                        "СТРАХОВКА: %d оплаченных заказов без тега >%.0fмин — "
+                        "shalamo недоступен? orders=%s",
+                        len(stuck),
+                        cfg.shalamo.stranded_alert_after_seconds / 60,
+                        ", ".join(o["order_id"] for o in stuck[:20]),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Реконсилятор тегов: ошибка цикла")
 
     # ── создание платежа через прямой Долями ─────────────────────────────────
 
@@ -340,6 +534,12 @@ def create_app(
             return _resp(InitStatus.CREATED, 200, order_id=order_id, pay_url=res.link)
 
         database.mark_failed(order_id, f"Долями create: {res.error_code} {res.message}")
+        log.error(
+            "init-payment: Dolyame create details order=%s code=%s msg=%s",
+            order_id,
+            res.error_code,
+            res.message,
+        )
         log.error("init-payment: Долями не создал заказ order=%s", order_id)
         return _resp(
             InitStatus.PAYMENT_CREATION_FAILED, 502, order_id=order_id,
@@ -383,6 +583,12 @@ def create_app(
             return _resp(InitStatus.CREATED, 200, order_id=order_id, pay_url=res.link)
 
         database.mark_failed(order_id, f"Credit Broker create: {res.error_code} {res.message}")
+        log.error(
+            "init-payment: Credit Broker create details order=%s code=%s msg=%s",
+            order_id,
+            res.error_code,
+            res.message,
+        )
         log.error("init-payment: Credit Broker не создал заявку order=%s", order_id)
         return _resp(
             InitStatus.PAYMENT_CREATION_FAILED, 502, order_id=order_id,
@@ -402,6 +608,17 @@ def create_app(
         ):
             log.warning("init-payment: неверный X-Secret-Token")
             return _resp(InitStatus.FORBIDDEN, 403)
+
+        log.info(
+            "init-payment: входящий запрос product=%s method=%s amount=%s "
+            "force=%s has_email=%s has_phone=%s",
+            req.product_id,
+            req.payment_method,
+            req.amount,
+            req.force,
+            bool(req.email),
+            bool(req.phone),
+        )
 
         # 2. товар: серверный (из config.products) ЛИБО cart-режим (product_id нет
         #    в конфиге → платформа сама задаёт состав заказа в `cart` и сумму в
@@ -442,7 +659,19 @@ def create_app(
         #   И запрошенный метод — НЕ tbank_credit (чтобы не зациклиться),
         #   то переключаем на кредитный способ оплаты. Только для серверного товара
         #   (в cart-режиме способ задаёт платформа явно, авто-апгрейда нет).
-        amount = req.amount
+        amount = req.amount if req.amount is not None else (
+            product.amount if product is not None else None
+        )
+        if amount is None:
+            log.warning(
+                "init-payment: сумма не передана и не задана в config product_id=%s",
+                req.product_id,
+            )
+            return _resp(
+                InitStatus.INVALID_PRODUCT, 400,
+                message="amount is required for this product",
+            )
+
         effective_method = req.payment_method
         if (
             not cart_mode
@@ -459,8 +688,13 @@ def create_app(
                 )
                 effective_method = credit_method
 
-        # 4. товар уже оплачен (PRD §7.3)
-        paid = database.find_paid_order(req.contact_id, req.product_id)
+        # 4. товар уже оплачен (PRD §7.3). force=True означает новое оформление:
+        #    ранее успешная оплата не должна блокировать повторную покупку.
+        paid = (
+            None
+            if req.force
+            else database.find_paid_order(req.contact_id, req.product_id)
+        )
         if paid is not None:
             if paid["tag_assigned_at"]:
                 log.info(
@@ -545,6 +779,12 @@ def create_app(
             )
 
         database.mark_failed(order_id, f"Init: {init.error_code} {init.message}")
+        log.error(
+            "init-payment: TBank Init details order=%s code=%s msg=%s",
+            order_id,
+            init.error_code,
+            init.message,
+        )
         log.error("init-payment: Т-Банк не создал платёж order=%s", order_id)
         return _resp(
             InitStatus.PAYMENT_CREATION_FAILED, 502, order_id=order_id,
@@ -561,13 +801,18 @@ def create_app(
             log.error("webhook: тело не разобралось как JSON")
             return PlainTextResponse("OK")
 
+        # DEBUG: входящее тело (mask_secrets маскирует Token/Password)
+        log.debug("webhook Т-Банк: входящее тело %s", mask_secrets(payload))
+
         # 1. подпись — пароль выбираем по TerminalKey (может быть доп. магазин)
         terminal_key = str(payload.get("TerminalKey"))
         password = cfg.password_for_terminal_key(terminal_key)
         if password is None:
             log.error("webhook: неизвестный TerminalKey=%s — не обрабатываем", terminal_key)
             return PlainTextResponse("OK")
-        if not verify_webhook_token(payload, password):
+        sig_valid = verify_webhook_token(payload, password)
+        log.debug("webhook Т-Банк: подпись %s", "OK" if sig_valid else "НЕВЕРНАЯ")
+        if not sig_valid:
             log.error("webhook: НЕВЕРНАЯ ПОДПИСЬ — не обрабатываем как оплату")
             return PlainTextResponse("OK")
 
@@ -648,6 +893,7 @@ def create_app(
 
         # 4f. обе попытки неуспешны — НЕ возвращаем OK, отдаём 503 (PRD §7.8)
         log.error("webhook: возвращаем 503 order=%s — Т-Банк повторит webhook", oid)
+        log.debug("webhook Т-Банк: итог order=%s — 503, повтор", oid)
         return PlainTextResponse("Service Unavailable", status_code=503)
 
     # ── /webhook/dolyame ───────────────────────────────────────────────────
@@ -671,6 +917,7 @@ def create_app(
             log.error("webhook Долями: тело не разобралось как JSON")
             return PlainTextResponse("OK")
         order_id = payload.get("id")
+        log.debug("webhook Долями: входящее тело %s ip=%s", mask_secrets(payload), client_ip)
         log.info(
             "webhook Долями: order=%s status=%s (тело не доверяем, проверяем /info)",
             order_id, payload.get("status"),
@@ -769,6 +1016,7 @@ def create_app(
         if ok:
             return PlainTextResponse("OK")
         log.error("webhook Долями: тег не назначен order=%s — 503, повтор", oid)
+        log.debug("webhook Долями: итог order=%s — 503, повтор", oid)
         return PlainTextResponse("Service Unavailable", status_code=503)
 
     # ── Credit Broker: общая обработка статуса (webhook + фоновый опрос) ────────
@@ -867,17 +1115,32 @@ def create_app(
         methods = cfg.credit_broker_methods()
         while True:
             await asyncio.sleep(interval)
+            set_request_id(f"poll-credit-{str(uuid.uuid4())[:8]}")
             try:
                 orders = database.get_pending_credit_orders(methods, CREDIT_POLL_MAX_AGE_SECONDS)
+                total = len(orders)
+                ok_count = err_count = 0
                 for order in orders:
                     try:
-                        await process_credit_status(
+                        if await process_credit_status(
                             order, attempts=CREDIT_POLL_TAG_ATTEMPTS, source="poll"
-                        )
+                        ):
+                            ok_count += 1
+                        else:
+                            err_count += 1
                     except Exception:
+                        err_count += 1
                         log.exception(
                             "poll Credit Broker: ошибка обработки order=%s", order["order_id"]
                         )
+                metrics["last_poll_run"] = datetime.now(timezone.utc).isoformat()
+                if total > 0:
+                    log.info(
+                        "poll Credit Broker: обработано=%d успешно=%d ошибок=%d",
+                        total, ok_count, err_count,
+                    )
+                else:
+                    log.debug("poll Credit Broker: нет заявок для опроса")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -911,6 +1174,7 @@ def create_app(
 
         order_id = payload.get("orderNumber")
         application_id = payload.get("id")
+        log.debug("webhook Credit Broker: входящее тело %s", mask_secrets(payload))
         log.info(
             "webhook Credit Broker: order=%s app_id=%s status=%s (проверяем /info)",
             order_id, application_id, payload.get("status"),
@@ -939,8 +1203,20 @@ def create_app(
     # ── /health ──────────────────────────────────────────────────────────────
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    async def health() -> dict[str, Any]:
+        # Деградация (подстраховка shalamo-401): если есть оплаченные заказы без тега
+        # старше порога — отдаём degraded + счётчик, чтобы внешний uptime-монитор
+        # увидел проблему без push-инфраструктуры. HTTP всегда 200 (сервис жив).
+        uptime_seconds = int(time.monotonic() - _start_time)
+        base: dict[str, Any] = {
+            "uptime_seconds": uptime_seconds,
+            "session_tags_granted": metrics["tags_granted"],
+            "last_reconcile_run": metrics["last_reconcile_run"],
+        }
+        stranded = len(_stranded_orders())
+        if stranded:
+            return {**base, "status": "degraded", "stranded": stranded}
+        return {**base, "status": "ok"}
 
     return app
 
