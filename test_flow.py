@@ -88,7 +88,11 @@ def main() -> int:
     shalamo = FakeShalamo()
     client = TestClient(create_app(config=cfg, db=db, tbank=tbank, shalamo=shalamo))
 
-    basic = {"contact_id": "c1", "product_id": "course_basic", "payment_method": "card"}
+    # amount обязателен с коммита 8af9577 (09.06.2026): из конфига товара он больше
+    # не берётся, сумму всегда передаёт платформа. 9900 = 99 руб, совпадает с Amount
+    # в webhook-payload ниже и с FakeTBank.state.
+    basic = {"contact_id": "c1", "product_id": "course_basic", "payment_method": "card",
+             "amount": 9900}
     hdr = {"X-Secret-Token": SECRET}
 
     print("1. Защита токеном")
