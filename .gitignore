@@ -1,6 +1,9 @@
 # secrets / local config — НИКОГДА не коммитить
 .env
 config.yaml
+# второй инстанс того же кода — касса бота @arhi_botov_bot (VPS 72.56.77.253),
+# свои боевые ключи Т-Банка; хранится рядом, чтобы не потерять при обновлении кода
+config.arhi-botov.yaml
 *.pem
 *.key
 *.crt
@@ -34,3 +37,13 @@ DOLYAMI-INSTALLMENTS-INTEGRATION-GUIDE.*
 *.jpg
 *.jpeg
 *.docx
+
+# персональные данные клиентов — выгрузки из бота и CRM (TG_ID, имена, @username,
+# персональные start-ссылки). У репозитория есть публичный remote на GitHub,
+# один `git add -A` внутри папки утёк бы всё это наружу.
+*.csv
+*.xlsx
+POL_ZOVATELI.csv
+
+# локальное состояние редактора, не код проекта
+.claude/
