@@ -1,0 +1,157 @@
+{
+  "success": true,
+  "demo": true,
+  "count": 25,
+  "items": [
+    {
+      "id": "demo-1",
+      "text": "Тест API: сообщение 1 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-2",
+      "text": "Тест API: сообщение 2 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-3",
+      "text": "Тест API: сообщение 3 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-4",
+      "text": "Тест API: сообщение 4 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-5",
+      "text": "Тест API: сообщение 5 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-6",
+      "text": "Тест API: сообщение 6 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-7",
+      "text": "Тест API: сообщение 7 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-8",
+      "text": "Тест API: сообщение 8 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-9",
+      "text": "Тест API: сообщение 9 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-10",
+      "text": "Тест API: сообщение 10 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-11",
+      "text": "Тест API: сообщение 11 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-12",
+      "text": "Тест API: сообщение 12 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-13",
+      "text": "Тест API: сообщение 13 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-14",
+      "text": "Тест API: сообщение 14 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-15",
+      "text": "Тест API: сообщение 15 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-16",
+      "text": "Тест API: сообщение 16 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-17",
+      "text": "Тест API: сообщение 17 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-18",
+      "text": "Тест API: сообщение 18 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-19",
+      "text": "Тест API: сообщение 19 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-20",
+      "text": "Тест API: сообщение 20 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-21",
+      "text": "Тест API: сообщение 21 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-22",
+      "text": "Тест API: сообщение 22 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-23",
+      "text": "Тест API: сообщение 23 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-24",
+      "text": "Тест API: сообщение 24 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    },
+    {
+      "id": "demo-25",
+      "text": "Тест API: сообщение 25 из 25.\nЭта запись пришла в общем JSON-массиве.",
+      "button_text": "Открыть исходный JSON",
+      "url": "https://pay.sushi-house-39.ru/leadteh-demo/messages-25.json"
+    }
+  ]
+}
