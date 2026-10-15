@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -146,21 +145,22 @@ class ShalamoClient:
     async def _set_variables_one_by_one(
         self, contact_id: str, variables: dict[str, Any]
     ) -> ShalamoResult:
-        """По запросу на переменную, параллельно — чтобы время webhook не росло
-        с числом переменных. Успех — только если записались все."""
+        """По запросу на переменную, строго по очереди: параллельные записи в один
+        контакт shalamov.io теряет — оба ответа 200, сохраняется одна (проверено
+        15.10.2026 на receipt_id/receipt_url). Первая ошибка обрывает серию: API,
+        скорее всего, лежит, а каждый следующий таймаут задерживает выдачу доступа."""
         items = [(k, v) for k, v in variables.items() if v is not None and v != ""]
-        if not items:
-            return ShalamoResult(ok=True)
         assert self.config.set_variables is not None
-        results = await asyncio.gather(*(
-            self._call(
+        for i, (name, value) in enumerate(items):
+            res = await self._call(
                 self.config.set_variables,
                 {"contact_id": contact_id, "name": name, "value": value},
                 op=f"set_variable {name}",
             )
-            for name, value in items
-        ))
-        failed = [name for (name, _), r in zip(items, results) if not r.ok]
-        if failed:
-            return ShalamoResult(ok=False, error=f"не записаны: {', '.join(failed)}")
+            if not res.ok:
+                skipped = [n for n, _ in items[i:]]
+                return ShalamoResult(
+                    ok=False, status_code=res.status_code,
+                    error=f"не записаны: {', '.join(skipped)} ({res.error})",
+                )
         return ShalamoResult(ok=True)

@@ -129,9 +129,9 @@ def test_set_variables_one_per_request(monkeypatch):
         {"payment_order_id": "Доступ_3015701_af999e2e", "payment_id": "", "payment_amount": 5500, "x": None},
     ))
     assert res.ok
-    assert sorted(seen, key=lambda b: b["name"]) == [
-        {"contact_id": "3015701", "name": "payment_amount", "value": "5500"},
+    assert seen == [  # по очереди, в исходном порядке
         {"contact_id": "3015701", "name": "payment_order_id", "value": "Доступ_3015701_af999e2e"},
+        {"contact_id": "3015701", "name": "payment_amount", "value": "5500"},
     ]
 
 
@@ -155,5 +155,5 @@ def test_set_variables_one_per_request_partial_failure(monkeypatch):
         ),
         set_variables_one_per_request=True,
     )
-    res = asyncio.run(ShalamoClient(cfg).set_variables("1", {"a": "1", "b": "2"}))
-    assert not res.ok and "b" in res.error
+    res = asyncio.run(ShalamoClient(cfg).set_variables("1", {"a": "1", "b": "2", "c": "3"}))
+    assert not res.ok and "b, c" in res.error  # после сбоя серия обрывается

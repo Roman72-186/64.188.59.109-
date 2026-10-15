@@ -277,13 +277,16 @@ def create_app(
         variables = _payment_variables(cfg, order)
         last_error: Optional[str] = None
 
+        # Переменные — один раз до тега, а не на каждой попытке: в shalamov.io это
+        # запрос на переменную, и повтор серии растягивал бы webhook за таймаут банка.
+        var_res = await shalamo_client.set_variables(contact_id, variables)
+        if not var_res.ok:
+            log.warning(
+                "shalamo: переменные не установлены order=%s: %s",
+                order["order_id"], var_res.error,
+            )
+
         for attempt in range(1, attempts + 1):
-            var_res = await shalamo_client.set_variables(contact_id, variables)
-            if not var_res.ok:
-                log.warning(
-                    "shalamo: переменные не установлены (попытка %d/%d) order=%s: %s",
-                    attempt, attempts, order["order_id"], var_res.error,
-                )
             async with _tag_lock:
                 # Повторная проверка под локом: другой путь (webhook-ретрай/реконсилятор)
                 # мог назначить тег, пока мы ждали set_variables — не дёргаем shalamo
