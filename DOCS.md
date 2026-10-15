@@ -599,7 +599,12 @@ X-Secret-Token: <тот же токен, что в config.yaml>
 
 ### `GET /health`
 
-Проверка живости. Возвращает `{"status":"ok"}`.
+Проверка живости. Возвращает `{"status":"ok"}` (HTTP 200). Если есть оплаченные
+заказы без тега старше `shalamo.stranded_alert_after_seconds` — отдаёт
+`{"status":"degraded","stranded":N}` (**тоже HTTP 200** — сервис жив): сигнал, что
+shalamo, вероятно, недоступен/сменил контракт. Внешний uptime-монитор должен
+проверять **тело ответа** (`status != "ok"` / наличие `stranded`), а не код —
+код всегда 200.
 
 ### `POST /init-payment`
 
@@ -788,12 +793,21 @@ sqlite3 payments.db "SELECT order_id, status, tag_name, created_at FROM payments
 восстановлении shalamov.io тег назначится автоматически (платёж в статусе
 `processing`, `paid_at` проставлен, `tag_assigned_at` пуст). Ручной разбор нужен,
 только если Т-Банк исчерпал повторы: назначь тег вручную через API shalamov.io.
-Причина обычно в блоке `shalamo` в `config.yaml` (неверный путь/формат — см. §9.1)
-или временная недоступность shalamov.io. Найти зависшие платежи:
+Причина обычно в блоке `shalamo` в `config.yaml` (неверный путь/формат/авторизация —
+см. §9.1) или временная недоступность shalamov.io. Найти зависшие платежи:
 
 ```bash
 sqlite3 payments.db "SELECT order_id, last_error FROM payments WHERE paid_at IS NOT NULL AND tag_assigned_at IS NULL;"
 ```
+
+**Подстраховка (с инцидента 28.06.2026, см. [docs/incidents/2026-06-28-shalamo-auth-401.md](docs/incidents/2026-06-28-shalamo-auth-401.md)).**
+Если задан `shalamo.reconcile_interval_seconds > 0`, фоновый реконсилятор сам добивает
+такие заказы — после восстановления shalamo застрявшие теги назначаются **без ручного
+вмешательства** (касается всех способов, не только Т-Банка). При застревании дольше
+`shalamo.stranded_alert_after_seconds` пишется сигнал — `grep CRITICAL logs/app.log` —
+и `/health` отдаёт `degraded`. Массовые 401 `{"error":"unauthorized"}` от shalamo =
+проблема авторизации (ключ/схема): shalamo с 28.06.2026 требует `Authorization: Bearer`
+(`shalamo.auth: in: header`), а не `?api_token=` — проверь блок `shalamo.auth`.
 
 **Т-Банк шлёт webhook повторно.**
 Прокладка обязана отвечать ровно `OK` с кодом 200. Проверь, что nginx не

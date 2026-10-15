@@ -23,6 +23,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator, Optional
 
 ACTIVE_LINK_MAX_AGE_SECONDS = 3600  # PRD §7.2: активная ссылка живёт 1 час
+# Защита от двойного нажатия при force=True: оплата того же товара на ту же сумму
+# моложе этого окна считается дублем, а не новой покупкой (продление через месяц
+# под окно не попадает).
+RECENT_PAID_WINDOW_SECONDS = 30 * 60
 
 
 def _utcnow() -> str:
@@ -49,6 +53,7 @@ CREATE TABLE IF NOT EXISTS payments (
     paid_at           TEXT,                         -- банк подтвердил оплату (CONFIRMED)
     tag_assigned_at   TEXT,                         -- тег успешно назначен в shalamo
     fail_tag_assigned_at TEXT,                       -- тег ОТКАЗА назначен (отдельный факт)
+    credit_not_found_count INTEGER NOT NULL DEFAULT 0, -- подряд 404 от T-Bank Credit Broker /info
     last_error        TEXT,
     created_at        TEXT    NOT NULL,
     updated_at        TEXT    NOT NULL
@@ -74,7 +79,6 @@ class Database:
         conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=10000")
             conn.execute("PRAGMA foreign_keys=ON")
             yield conn
@@ -87,6 +91,7 @@ class Database:
 
     def init_db(self) -> None:
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
             self._migrate(conn)
 
@@ -113,6 +118,11 @@ class Database:
             conn.execute(
                 "UPDATE payments SET receipt_sent_at = updated_at "
                 "WHERE receipt_sent_at IS NULL"
+            )
+        if "credit_not_found_count" not in cols:
+            conn.execute(
+                "ALTER TABLE payments "
+                "ADD COLUMN credit_not_found_count INTEGER NOT NULL DEFAULT 0"
             )
 
     # ── чтение ──────────────────────────────────────────────────────────────
@@ -143,30 +153,40 @@ class Database:
         product_id: str,
         payment_method: str,
         max_age_seconds: int = ACTIVE_LINK_MAX_AGE_SECONDS,
+        amount: Optional[int] = None,
     ) -> Optional[dict[str, Any]]:
         """PRD §7.2: неоплаченная ссылка (status='pending', есть pay_url),
-        созданная не более max_age_seconds назад."""
+        созданная не более max_age_seconds назад. `amount` — только ссылка
+        на ту же сумму (копейки)."""
         threshold = (
             datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
         ).isoformat()
+        sql = (
+            "SELECT * FROM payments "
+            "WHERE contact_id = ? AND product_id = ? AND payment_method = ? "
+            "  AND status = 'pending' AND pay_url IS NOT NULL "
+            "  AND created_at >= ? "
+        )
+        params: list[Any] = [contact_id, product_id, payment_method, threshold]
+        if amount is not None:
+            sql += "  AND amount = ? "
+            params.append(amount)
         with self._connect() as conn:
-            cur = conn.execute(
-                "SELECT * FROM payments "
-                "WHERE contact_id = ? AND product_id = ? AND payment_method = ? "
-                "  AND status = 'pending' AND pay_url IS NOT NULL "
-                "  AND created_at >= ? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (contact_id, product_id, payment_method, threshold),
-            )
+            cur = conn.execute(sql + "ORDER BY created_at DESC LIMIT 1", params)
             return self._row(cur.fetchone())
 
     def get_pending_credit_orders(
-        self, payment_methods: list[str], max_age_seconds: int
+        self,
+        payment_methods: list[str],
+        max_age_seconds: int,
+        max_not_found_count: int,
     ) -> list[dict[str, Any]]:
         """Заявки Credit Broker (provider=tbank_credit) без финального исхода —
         для фонового опроса GET /info (см. модуль tbank_credit). Условие то же,
         что у идемпотентного захвата: ни тег успеха, ни тег отказа ещё не
-        назначены. `max_age_seconds` отсекает давно заброшенные заявки."""
+        назначены. `max_age_seconds` отсекает давно заброшенные заявки.
+        `max_not_found_count` исключает заявки, которые Credit Broker стабильно
+        не находит по /info и которые уже переведены в финальный failed."""
         if not payment_methods:
             return []
         threshold = (
@@ -178,9 +198,10 @@ class Database:
                 f"SELECT * FROM payments "
                 f"WHERE payment_method IN ({placeholders}) "
                 f"  AND tag_assigned_at IS NULL AND fail_tag_assigned_at IS NULL "
+                f"  AND credit_not_found_count < ? "
                 f"  AND created_at >= ? "
                 f"ORDER BY created_at ASC",
-                (*payment_methods, threshold),
+                (*payment_methods, max_not_found_count, threshold),
             )
             return [dict(r) for r in cur.fetchall()]
 
@@ -209,6 +230,29 @@ class Database:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    def get_paid_untagged_orders(
+        self, max_age_seconds: int
+    ) -> list[dict[str, Any]]:
+        """Подстраховка (см. инцидент shalamo-401): оплаченные заказы
+        (paid_at IS NOT NULL), по которым тег ещё НЕ назначен (tag_assigned_at IS NULL).
+        Это «оплачено банком, но доступ не выдан» (PRD §7.3) — фоновый реконсилятор
+        добивает их через grant_access, когда shalamo снова доступен. Не зависит от
+        провайдера (любой способ оплаты). `max_age_seconds` отсекает давно
+        заброшенные заказы. Окно считаем по paid_at — это момент, с которого заказ
+        стал «оплачен, но без тега»."""
+        threshold = (
+            datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+        ).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                "SELECT * FROM payments "
+                "WHERE paid_at IS NOT NULL AND tag_assigned_at IS NULL "
+                "  AND paid_at >= ? "
+                "ORDER BY paid_at ASC",
+                (threshold,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
     def mark_receipt_sent(self, order_id: str) -> None:
         """Чек успешно принят кассой (Queued). Фиксируем receipt_sent_at —
         заказ больше не попадает в get_unfiscalized_orders."""
@@ -222,17 +266,30 @@ class Database:
             )
 
     def find_paid_order(
-        self, contact_id: str, product_id: str
+        self,
+        contact_id: str,
+        product_id: str,
+        paid_within_seconds: Optional[int] = None,
+        amount: Optional[int] = None,
     ) -> Optional[dict[str, Any]]:
         """PRD §7.3: любой платёж по товару, подтверждённый банком (paid_at IS NOT NULL),
-        независимо от того, назначен ли уже тег."""
+        независимо от того, назначен ли уже тег. `paid_within_seconds` и `amount` —
+        только свежая оплата на ту же сумму (защита от двойного нажатия при force)."""
+        sql = (
+            "SELECT * FROM payments "
+            "WHERE contact_id = ? AND product_id = ? AND paid_at IS NOT NULL "
+        )
+        params: list[Any] = [contact_id, product_id]
+        if paid_within_seconds is not None:
+            sql += "  AND paid_at >= ? "
+            params.append((
+                datetime.now(timezone.utc) - timedelta(seconds=paid_within_seconds)
+            ).isoformat())
+        if amount is not None:
+            sql += "  AND amount = ? "
+            params.append(amount)
         with self._connect() as conn:
-            cur = conn.execute(
-                "SELECT * FROM payments "
-                "WHERE contact_id = ? AND product_id = ? AND paid_at IS NOT NULL "
-                "ORDER BY id DESC LIMIT 1",
-                (contact_id, product_id),
-            )
+            cur = conn.execute(sql + "ORDER BY id DESC LIMIT 1", params)
             return self._row(cur.fetchone())
 
     # ── запись ──────────────────────────────────────────────────────────────
@@ -290,11 +347,36 @@ class Database:
                 (tbank_status, _utcnow(), order_id),
             )
 
+    def reset_credit_not_found(self, order_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE payments SET credit_not_found_count = 0, updated_at = ? "
+                "WHERE order_id = ? AND credit_not_found_count != 0",
+                (_utcnow(), order_id),
+            )
+
+    def record_credit_not_found(self, order_id: str, error: str) -> int:
+        now = _utcnow()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE payments SET "
+                "credit_not_found_count = credit_not_found_count + 1, "
+                "last_error = ?, updated_at = ? "
+                "WHERE order_id = ?",
+                (error, now, order_id),
+            )
+            cur = conn.execute(
+                "SELECT credit_not_found_count FROM payments WHERE order_id = ?",
+                (order_id,),
+            )
+            row = cur.fetchone()
+            return int(row["credit_not_found_count"]) if row else 0
+
     def mark_failed(self, order_id: str, error: Optional[str] = None) -> None:
         with self._connect() as conn:
             conn.execute(
                 "UPDATE payments SET status = 'failed', last_error = ?, "
-                "updated_at = ? WHERE order_id = ?",
+                "updated_at = ? WHERE order_id = ? AND status != 'confirmed'",
                 (error, _utcnow(), order_id),
             )
 

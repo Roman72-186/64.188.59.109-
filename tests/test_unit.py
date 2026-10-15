@@ -89,12 +89,24 @@ def test_get_pending_credit_orders_filters():
     db.capture_fail_tag("o3")
     db.mark_fail_tag_assigned("o3")
 
-    pending = db.get_pending_credit_orders(["credit"], max_age_seconds=3600)
+    pending = db.get_pending_credit_orders(
+        ["credit"], max_age_seconds=3600, max_not_found_count=3
+    )
     ids = {o["order_id"] for o in pending}
     assert ids == {"o1"}  # o2/o3 завершены, o4 — другой способ оплаты
 
     # max_age=0 -> только что созданные заявки уже "устарели"
-    assert db.get_pending_credit_orders(["credit"], max_age_seconds=0) == []
+    assert (
+        db.get_pending_credit_orders(
+            ["credit"], max_age_seconds=0, max_not_found_count=3
+        )
+        == []
+    )
 
     # неизвестный способ оплаты -> ничего
-    assert db.get_pending_credit_orders(["installment_3"], max_age_seconds=3600) == []
+    assert (
+        db.get_pending_credit_orders(
+            ["installment_3"], max_age_seconds=3600, max_not_found_count=3
+        )
+        == []
+    )

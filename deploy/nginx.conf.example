@@ -2,6 +2,10 @@
 # Сертификат: certbot --nginx. Домен: pay.sushi-house-39.ru
 # (при смене домена замени pay.sushi-house-39.ru во всех строках ниже).
 
+# Rate limiting: защита webhook-эндпоинтов от flood
+limit_req_zone $binary_remote_addr zone=webhook:10m rate=30r/m;
+limit_req_zone $binary_remote_addr zone=api:10m rate=60r/m;
+
 server {
     listen 443 ssl;
     server_name pay.sushi-house-39.ru;
@@ -9,16 +13,37 @@ server {
     ssl_certificate     /etc/letsencrypt/live/pay.sushi-house-39.ru/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/pay.sushi-house-39.ru/privkey.pem;
 
-    location / {
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+
+    client_max_body_size 1m;
+
+    # Security headers
+    add_header X-Content-Type-Options nosniff;
+    add_header X-Frame-Options DENY;
+    add_header Referrer-Policy no-referrer;
+
+    # Webhook-эндпоинты: rate limit + увеличенный таймаут (2 попытки shalamo)
+    location ~* ^/webhook/ {
+        limit_req zone=webhook burst=10 nodelay;
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-
-        # webhook Т-Банка: не подменять тело ответа (нужен ровно "OK"),
-        # дать времени на 2 попытки назначения тега
         proxy_read_timeout 30s;
+        proxy_connect_timeout 5s;
+    }
+
+    location / {
+        limit_req zone=api burst=20 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 15s;
+        proxy_connect_timeout 5s;
     }
 }
 

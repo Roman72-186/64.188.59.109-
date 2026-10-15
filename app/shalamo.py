@@ -8,10 +8,13 @@
   "{contact_id}" -> str id контакта
   "{tag}"        -> str имя тега
   "{variables}"  -> dict переменных (подставляется как объект, не строка)
+  "{name}", "{value}" -> имя и значение одной переменной
+                     (режим set_variables_one_per_request)
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -91,21 +94,24 @@ class ShalamoClient:
         if body:  # пустое тело не отправляем (query-style API)
             headers["Content-Type"] = "application/json"
             kwargs["json"] = body
+        t0 = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as client:
                 resp = await client.request(
                     endpoint.method.upper(), url, headers=headers, **kwargs
                 )
         except Exception as e:  # сеть/таймаут
-            log.error("shalamo %s: ошибка запроса: %s", op, e)
+            ms = (time.perf_counter() - t0) * 1000
+            log.error("shalamo %s: ошибка запроса (%.0fms): %s", op, ms, e)
             return ShalamoResult(ok=False, error=str(e))
+        ms = (time.perf_counter() - t0) * 1000
 
         if self._is_success(endpoint, resp.status_code):
-            log.info("shalamo %s OK (HTTP %s)", op, resp.status_code)
+            log.info("shalamo %s OK (HTTP %s %.0fms)", op, resp.status_code, ms)
             return ShalamoResult(ok=True, status_code=resp.status_code, raw=resp.text)
 
         log.error(
-            "shalamo %s отказ: HTTP %s body=%s", op, resp.status_code, resp.text[:500]
+            "shalamo %s отказ: HTTP %s body=%s (%.0fms)", op, resp.status_code, resp.text[:500], ms
         )
         return ShalamoResult(
             ok=False,
@@ -128,8 +134,33 @@ class ShalamoClient:
         # (best-effort, тег это не блокирует).
         if self.config.set_variables is None:
             return ShalamoResult(ok=True, error="set_variables endpoint не настроен")
+        if self.config.set_variables_one_per_request:
+            return await self._set_variables_one_by_one(contact_id, variables)
         return await self._call(
             self.config.set_variables,
             {"contact_id": contact_id, "variables": variables},
             op="set_variables",
         )
+
+    async def _set_variables_one_by_one(
+        self, contact_id: str, variables: dict[str, Any]
+    ) -> ShalamoResult:
+        """По запросу на переменную, строго по очереди: параллельные записи в один
+        контакт shalamov.io теряет — оба ответа 200, сохраняется одна (проверено
+        15.10.2026 на receipt_id/receipt_url). Первая ошибка обрывает серию: API,
+        скорее всего, лежит, а каждый следующий таймаут задерживает выдачу доступа."""
+        items = [(k, v) for k, v in variables.items() if v is not None and v != ""]
+        assert self.config.set_variables is not None
+        for i, (name, value) in enumerate(items):
+            res = await self._call(
+                self.config.set_variables,
+                {"contact_id": contact_id, "name": name, "value": value},
+                op=f"set_variable {name}",
+            )
+            if not res.ok:
+                skipped = [n for n, _ in items[i:]]
+                return ShalamoResult(
+                    ok=False, status_code=res.status_code,
+                    error=f"не записаны: {', '.join(skipped)} ({res.error})",
+                )
+        return ShalamoResult(ok=True)
