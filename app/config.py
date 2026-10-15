@@ -94,6 +94,10 @@ class ShalamoConfig(BaseModel):
     assign_tag: ShalamoEndpoint
     # Переменные контакта — best-effort. Если endpoint не задан, шаг пропускается.
     set_variables: ShalamoEndpoint | None = None
+    # API принимает одну переменную за запрос (shalamov.io: setContactVariable с
+    # contact_id/name/value). Тогда set_variables зовётся по разу на переменную,
+    # в шаблонах доступны {name} и {value}; пустые значения не шлются.
+    set_variables_one_per_request: bool = False
     # Подстраховка (инцидент shalamo-401): фоновый реконсилятор добивает
     # «оплачено, но тег не назначен». 0 = выключено (как у поллеров провайдеров).
     reconcile_interval_seconds: float = 0

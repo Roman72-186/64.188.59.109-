@@ -158,6 +158,28 @@ def test_send_receipt_body_auth_idempotency(monkeypatch):
     assert captured["headers"]["authorization"].lower().startswith("basic ")
 
 
+def test_send_receipt_cyrillic_order_id(monkeypatch):
+    """Номер заказа по-русски: заголовок X-Request-ID обязан быть ASCII, иначе httpx
+    падает ещё до отправки и чек не пробивается никогда (инцидент 18.09–15.10.2026).
+    В теле InvoiceId остаётся исходным, ключ заголовка — одинаковый на повторах."""
+    client, captured = _client_with_capture(
+        monkeypatch,
+        payload={"Success": True, "Message": "Queued", "Model": {"Id": "r-2"}},
+    )
+    oid = "Доступ в Практику Жизни_3014974_8a6649cc"
+    res = asyncio.run(
+        client.send_receipt(order_id=oid, account_id="3014974", name="Курс", amount_kopecks=640000)
+    )
+    assert res.success
+    import json
+    assert json.loads(captured["content"])["InvoiceId"] == oid
+    rid = captured["headers"]["x-request-id"]
+    assert rid.isascii() and rid.startswith("sha256-")
+    from app.cloudkassir import ascii_request_id
+    assert ascii_request_id(oid) == rid
+    assert ascii_request_id("ord-42") == "ord-42"
+
+
 def test_send_receipt_failure_does_not_mark(monkeypatch):
     client, _ = _client_with_capture(
         monkeypatch, payload={"Success": False, "Message": "INN invalid"}
@@ -298,3 +320,59 @@ def test_cloudkassir_methods_empty_when_disabled(monkeypatch):
 def test_cloudkassir_bad_provider_rejected(monkeypatch):
     with pytest.raises(Exception):
         _app_config(monkeypatch, providers=("dolyame", "bogus"))
+
+
+# ── ссылка на чек уходит контакту в переменные ───────────────────────────────
+
+
+def test_receipt_link_written_to_contact_variables(monkeypatch, tmp_path):
+    """Пробитый чек: id и ссылка уходят контакту в переменные receipt_id/receipt_url."""
+    import time
+    from datetime import datetime, timezone
+
+    from fastapi.testclient import TestClient
+
+    from app.cloudkassir import CloudKassirResult
+    from app.main import create_app
+    from app.shalamo import ShalamoResult
+
+    class FakeKassa:
+        async def send_receipt(self, **kw):
+            return CloudKassirResult(
+                success=True, queued=True, receipt_id="r-9", receipt_url="https://receipts.test/r-9"
+            )
+
+    class FakeShalamo:
+        def __init__(self):
+            self.vars = []
+
+        async def set_variables(self, contact_id, variables):
+            self.vars.append((contact_id, variables))
+            return ShalamoResult(ok=True)
+
+        async def assign_tag(self, contact_id, tag):
+            return ShalamoResult(ok=True)
+
+    cfg = _app_config(monkeypatch)
+    cfg.cloudkassir.poll_interval_seconds = 0.02
+    db = Database(db_path=str(tmp_path / "p.db"))
+    db.init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    with db._connect() as conn:
+        conn.execute(
+            "INSERT INTO payments (order_id, contact_id, product_id, payment_method,"
+            " amount, status, paid_at, tag_assigned_at, created_at, updated_at)"
+            " VALUES ('o-1','c-1','p','dolyami',9900,'confirmed',?,?,?,?)",
+            (now, now, now, now),
+        )
+    shalamo = FakeShalamo()
+    app = create_app(cfg, db, shalamo=shalamo, cloudkassir=FakeKassa())
+    with TestClient(app):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not shalamo.vars:
+            time.sleep(0.02)
+
+    assert db.get_by_order_id("o-1")["receipt_sent_at"] is not None
+    assert shalamo.vars[0] == (
+        "c-1", {"receipt_id": "r-9", "receipt_url": "https://receipts.test/r-9"}
+    )

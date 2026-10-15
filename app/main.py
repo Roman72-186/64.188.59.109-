@@ -377,6 +377,16 @@ def create_app(
                 "🧾 Чек CloudKassir принят order=%s id=%s url=%s",
                 oid, res.receipt_id, res.receipt_url,
             )
+            # Ссылку на чек — контакту в переменные (best-effort, как платёжные
+            # переменные): чек уже пробит, сбой записи его не отменяет.
+            var_res = await shalamo_client.set_variables(
+                order["contact_id"],
+                {"receipt_id": res.receipt_id, "receipt_url": res.receipt_url},
+            )
+            if not var_res.ok:
+                log.warning(
+                    "shalamo: ссылка на чек не записана order=%s: %s", oid, var_res.error
+                )
             return True
         log.error("🧾 Чек CloudKassir не пробит order=%s: %s — повтор позже", oid, res.error)
         return False

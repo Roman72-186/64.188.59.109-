@@ -97,3 +97,63 @@ def test_non_2xx_is_failure(monkeypatch):
     res = asyncio.run(client.assign_tag("1", "t"))
     assert not res.ok
     assert res.status_code == 400
+
+
+def test_set_variables_one_per_request(monkeypatch):
+    """shalamov.io принимает одну переменную за запрос: по запросу на переменную,
+    пустые значения не шлются."""
+    import json
+
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, text="OK")
+
+    transport = httpx.MockTransport(handler)
+    real_cls = httpx.AsyncClient
+    monkeypatch.setattr(
+        "app.shalamo.httpx.AsyncClient",
+        lambda *a, **kw: real_cls(*a, **{**kw, "transport": transport}),
+    )
+    cfg = _assign_tag_cfg(
+        set_variables=ShalamoEndpoint(
+            method="POST",
+            path="/setContactVariable",
+            body_template={"contact_id": "{contact_id}", "name": "{name}", "value": "{value}"},
+        ),
+        set_variables_one_per_request=True,
+    )
+    res = asyncio.run(ShalamoClient(cfg).set_variables(
+        "3015701",
+        {"payment_order_id": "Доступ_3015701_af999e2e", "payment_id": "", "payment_amount": 5500, "x": None},
+    ))
+    assert res.ok
+    assert sorted(seen, key=lambda b: b["name"]) == [
+        {"contact_id": "3015701", "name": "payment_amount", "value": "5500"},
+        {"contact_id": "3015701", "name": "payment_order_id", "value": "Доступ_3015701_af999e2e"},
+    ]
+
+
+def test_set_variables_one_per_request_partial_failure(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+        name = json.loads(request.content)["name"]
+        return httpx.Response(500 if name == "b" else 200, text="x")
+
+    transport = httpx.MockTransport(handler)
+    real_cls = httpx.AsyncClient
+    monkeypatch.setattr(
+        "app.shalamo.httpx.AsyncClient",
+        lambda *a, **kw: real_cls(*a, **{**kw, "transport": transport}),
+    )
+    cfg = _assign_tag_cfg(
+        set_variables=ShalamoEndpoint(
+            method="POST",
+            path="/setContactVariable",
+            body_template={"contact_id": "{contact_id}", "name": "{name}", "value": "{value}"},
+        ),
+        set_variables_one_per_request=True,
+    )
+    res = asyncio.run(ShalamoClient(cfg).set_variables("1", {"a": "1", "b": "2"}))
+    assert not res.ok and "b" in res.error

@@ -8,10 +8,13 @@
   "{contact_id}" -> str id контакта
   "{tag}"        -> str имя тега
   "{variables}"  -> dict переменных (подставляется как объект, не строка)
+  "{name}", "{value}" -> имя и значение одной переменной
+                     (режим set_variables_one_per_request)
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -132,8 +135,32 @@ class ShalamoClient:
         # (best-effort, тег это не блокирует).
         if self.config.set_variables is None:
             return ShalamoResult(ok=True, error="set_variables endpoint не настроен")
+        if self.config.set_variables_one_per_request:
+            return await self._set_variables_one_by_one(contact_id, variables)
         return await self._call(
             self.config.set_variables,
             {"contact_id": contact_id, "variables": variables},
             op="set_variables",
         )
+
+    async def _set_variables_one_by_one(
+        self, contact_id: str, variables: dict[str, Any]
+    ) -> ShalamoResult:
+        """По запросу на переменную, параллельно — чтобы время webhook не росло
+        с числом переменных. Успех — только если записались все."""
+        items = [(k, v) for k, v in variables.items() if v is not None and v != ""]
+        if not items:
+            return ShalamoResult(ok=True)
+        assert self.config.set_variables is not None
+        results = await asyncio.gather(*(
+            self._call(
+                self.config.set_variables,
+                {"contact_id": contact_id, "name": name, "value": value},
+                op=f"set_variable {name}",
+            )
+            for name, value in items
+        ))
+        failed = [name for (name, _), r in zip(items, results) if not r.ok]
+        if failed:
+            return ShalamoResult(ok=False, error=f"не записаны: {', '.join(failed)}")
+        return ShalamoResult(ok=True)

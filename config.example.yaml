@@ -58,14 +58,20 @@ shalamo:
       http_2xx: true
   # Переменные контакта — опционально и best-effort. Если блок отсутствует/закомментирован,
   # шаг пропускается (тег это не блокирует). Включить, когда известен реальный endpoint.
+  # shalamov.io принимает одну переменную за запрос (setContactVariable), поэтому
+  # set_variables_one_per_request: true — по запросу на переменную, {name}/{value}.
+  # Пишутся payment_status, payment_method, payment_amount (руб.), payment_order_id,
+  # payment_id (номер платежа Т-Банка), а после чека CloudKassir — receipt_id, receipt_url.
   # set_variables:
   #   method: "POST"
-  #   path: "/attachVariableToContact"
-  #   query_template:
+  #   path: "/setContactVariable"
+  #   body_template:
   #     contact_id: "{contact_id}"
-  #     name: "{variables}"
+  #     name: "{name}"
+  #     value: "{value}"
   #   success_when:
   #     http_2xx: true
+  # set_variables_one_per_request: true
   # Подстраховка (инцидент shalamo-401, 28.06.2026): фоновый реконсилятор добивает
   # «оплачено банком, но тег не назначен» (например, когда shalamo временно недоступен
   # или сменил контракт). 0 = выключено. Боевое значение — напр. 120 (раз в 2 мин).

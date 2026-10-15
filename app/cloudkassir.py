@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -151,6 +152,19 @@ def build_customer_receipt(
     return cr
 
 
+def ascii_request_id(value: str) -> str:
+    """X-Request-ID в виде, пригодном для HTTP-заголовка.
+
+    Заголовок допускает только ASCII, а order_id у товаров платформы бывает по-русски
+    («Доступ в Практику Жизни_3014974_8a6649cc»): httpx падал на кодировании, и чек
+    по такому заказу не пробивался вовсе (18.09–15.10.2026). ASCII-номер уходит как
+    есть, остальные — детерминированным sha256: повтор того же заказа даёт тот же
+    ключ, идемпотентность кассы сохраняется (дедуп по InvoiceId в теле не меняется)."""
+    if value.isascii():
+        return value
+    return "sha256-" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:40]
+
+
 class CloudKassirClient:
     def __init__(
         self, config: CloudKassirConfig, receipt: Optional[ReceiptConfig]
@@ -165,7 +179,7 @@ class CloudKassirClient:
 
     async def _post(self, path: str, body: dict[str, Any], request_id: str) -> CloudKassirResult:
         url = f"{self.base_url}{path}"
-        headers = {"X-Request-ID": request_id}
+        headers = {"X-Request-ID": ascii_request_id(request_id)}
         t0 = time.perf_counter()
         try:
             async with httpx.AsyncClient(
@@ -215,7 +229,7 @@ class CloudKassirClient:
         phone: Optional[str] = None,
     ) -> CloudKassirResult:
         """Пробить чек прихода (Type=Income). InvoiceId=order_id (дедуп на стороне
-        кассы), X-Request-ID=order_id (кэш повторов 1ч) — повторный вызов не
+        кассы), X-Request-ID=order_id в ASCII-виде (кэш повторов 1ч) — повторный вызов не
         создаёт второй чек."""
         customer_receipt = build_customer_receipt(
             name=name,
