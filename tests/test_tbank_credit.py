@@ -83,6 +83,8 @@ class FakeCredit:
     def __init__(self) -> None:
         self.create_succeeds = True
         self.info_succeeds = True
+        self.info_error_code: str | None = None
+        self.info_message = "timeout"
         self.commit_succeeds = True
         self.info_status = "signed"
         self.create_calls: list[dict] = []
@@ -107,7 +109,11 @@ class FakeCredit:
     async def info(self, order_number: str) -> CreditResult:
         self.info_calls.append(order_number)
         if not self.info_succeeds:
-            return CreditResult(success=False, message="timeout")
+            return CreditResult(
+                success=False,
+                error_code=self.info_error_code,
+                message=self.info_message,
+            )
         return CreditResult(success=True, status=self.info_status, order_number=order_number)
 
     async def commit(self, order_number: str) -> CreditResult:
@@ -395,6 +401,28 @@ def test_webhook_503_when_info_fails(tmp_path):
     assert r.status_code == 503
 
 
+def test_webhook_marks_not_found_failed_after_retries(tmp_path):
+    """Повторяющийся 404 от /info означает, что заявка не найдена в Credit Broker.
+    После порога переводим заказ в failed и больше не просим webhook повторять."""
+    env = _make_env(make_config(), tmp_path)
+    order_id = _create_credit_order(env)
+    env.credit.info_succeeds = False
+    env.credit.info_error_code = "404"
+    env.credit.info_message = "NotFound"
+
+    for expected_status in (503, 503, 200):
+        r = env.client.post(
+            "/webhook/tbank_credit",
+            json={"orderNumber": order_id, "status": "signed"},
+        )
+        assert r.status_code == expected_status
+
+    order = env.db.get_by_order_id(order_id)
+    assert order["status"] == "failed"
+    assert order["credit_not_found_count"] == 3
+    assert "404 NotFound" in order["last_error"]
+
+
 def test_webhook_503_when_commit_fails(tmp_path):
     """commit_on_webhook=True, commit падает — 503."""
     env = _make_env(make_config(commit_on_webhook=True), tmp_path)
@@ -532,6 +560,32 @@ def test_poll_assigns_fail_tag_for_rejected(tmp_path):
     order = env.db.get_by_order_id(order_id)
     assert order["fail_tag_assigned_at"] is not None
     assert order["status"] == "failed"
+
+
+def test_poll_stops_after_repeated_not_found(tmp_path):
+    """Поллер после нескольких 404 помечает заявку failed и больше не берёт её в опрос."""
+    env = _make_env(make_config(poll_interval_seconds=0.02), tmp_path)
+    order_id = _create_credit_order(env)
+    env.credit.info_succeeds = False
+    env.credit.info_error_code = "404"
+    env.credit.info_message = "NotFound"
+
+    with env.client:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            order = env.db.get_by_order_id(order_id)
+            if order["status"] == "failed":
+                break
+            time.sleep(0.02)
+
+        calls_after_failed = len(env.credit.info_calls)
+        time.sleep(0.08)
+
+    order = env.db.get_by_order_id(order_id)
+    assert order["status"] == "failed"
+    assert order["credit_not_found_count"] == 3
+    assert len(env.credit.info_calls) == calls_after_failed
+    assert len(env.shalamo.tag_calls) == 0
 
 
 def test_poll_disabled_by_default(tmp_path):

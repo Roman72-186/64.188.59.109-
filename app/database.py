@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS payments (
     paid_at           TEXT,                         -- банк подтвердил оплату (CONFIRMED)
     tag_assigned_at   TEXT,                         -- тег успешно назначен в shalamo
     fail_tag_assigned_at TEXT,                       -- тег ОТКАЗА назначен (отдельный факт)
+    credit_not_found_count INTEGER NOT NULL DEFAULT 0, -- подряд 404 от T-Bank Credit Broker /info
     last_error        TEXT,
     created_at        TEXT    NOT NULL,
     updated_at        TEXT    NOT NULL
@@ -114,6 +115,11 @@ class Database:
                 "UPDATE payments SET receipt_sent_at = updated_at "
                 "WHERE receipt_sent_at IS NULL"
             )
+        if "credit_not_found_count" not in cols:
+            conn.execute(
+                "ALTER TABLE payments "
+                "ADD COLUMN credit_not_found_count INTEGER NOT NULL DEFAULT 0"
+            )
 
     # ── чтение ──────────────────────────────────────────────────────────────
 
@@ -161,12 +167,17 @@ class Database:
             return self._row(cur.fetchone())
 
     def get_pending_credit_orders(
-        self, payment_methods: list[str], max_age_seconds: int
+        self,
+        payment_methods: list[str],
+        max_age_seconds: int,
+        max_not_found_count: int,
     ) -> list[dict[str, Any]]:
         """Заявки Credit Broker (provider=tbank_credit) без финального исхода —
         для фонового опроса GET /info (см. модуль tbank_credit). Условие то же,
         что у идемпотентного захвата: ни тег успеха, ни тег отказа ещё не
-        назначены. `max_age_seconds` отсекает давно заброшенные заявки."""
+        назначены. `max_age_seconds` отсекает давно заброшенные заявки.
+        `max_not_found_count` исключает заявки, которые Credit Broker стабильно
+        не находит по /info и которые уже переведены в финальный failed."""
         if not payment_methods:
             return []
         threshold = (
@@ -178,9 +189,10 @@ class Database:
                 f"SELECT * FROM payments "
                 f"WHERE payment_method IN ({placeholders}) "
                 f"  AND tag_assigned_at IS NULL AND fail_tag_assigned_at IS NULL "
+                f"  AND credit_not_found_count < ? "
                 f"  AND created_at >= ? "
                 f"ORDER BY created_at ASC",
-                (*payment_methods, threshold),
+                (*payment_methods, max_not_found_count, threshold),
             )
             return [dict(r) for r in cur.fetchall()]
 
@@ -312,6 +324,31 @@ class Database:
                 "WHERE order_id = ?",
                 (tbank_status, _utcnow(), order_id),
             )
+
+    def reset_credit_not_found(self, order_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE payments SET credit_not_found_count = 0, updated_at = ? "
+                "WHERE order_id = ? AND credit_not_found_count != 0",
+                (_utcnow(), order_id),
+            )
+
+    def record_credit_not_found(self, order_id: str, error: str) -> int:
+        now = _utcnow()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE payments SET "
+                "credit_not_found_count = credit_not_found_count + 1, "
+                "last_error = ?, updated_at = ? "
+                "WHERE order_id = ?",
+                (error, now, order_id),
+            )
+            cur = conn.execute(
+                "SELECT credit_not_found_count FROM payments WHERE order_id = ?",
+                (order_id,),
+            )
+            row = cur.fetchone()
+            return int(row["credit_not_found_count"]) if row else 0
 
     def mark_failed(self, order_id: str, error: Optional[str] = None) -> None:
         with self._connect() as conn:

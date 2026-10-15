@@ -59,6 +59,7 @@ NEGATIVE_TBANK_STATUSES = {"REJECTED", "DEADLINE_EXPIRED", "CANCELED", "AUTH_FAI
 # (с запасом на 14-дневное окно Commit после signed).
 CREDIT_POLL_TAG_ATTEMPTS = 2
 CREDIT_POLL_MAX_AGE_SECONDS = 30 * 24 * 3600
+CREDIT_INFO_NOT_FOUND_MAX_ATTEMPTS = 3
 
 # Фоновая фискализация CloudKassir: максимальный возраст оплаченного заказа, по
 # которому ещё пытаемся пробить чек (тот же запас, что у опроса Credit Broker).
@@ -1036,8 +1037,35 @@ def create_app(
 
         info = await credit_client.info(oid)
         if not info.success:
+            if info.error_code == "404":
+                count = database.record_credit_not_found(
+                    oid,
+                    "Credit Broker /info 404 NotFound",
+                )
+                if count >= CREDIT_INFO_NOT_FOUND_MAX_ATTEMPTS:
+                    database.mark_failed(
+                        oid,
+                        (
+                            "Credit Broker /info 404 NotFound "
+                            f"after {count} attempts"
+                        ),
+                    )
+                    log.error(
+                        "%s Credit Broker: /info 404 NotFound order=%s "
+                        "(%d/%d) — переводим в failed, дальнейший poll остановлен",
+                        source, oid, count, CREDIT_INFO_NOT_FOUND_MAX_ATTEMPTS,
+                    )
+                    return True
+                log.error(
+                    "%s Credit Broker: /info 404 NotFound order=%s "
+                    "(%d/%d) — повтор",
+                    source, oid, count, CREDIT_INFO_NOT_FOUND_MAX_ATTEMPTS,
+                )
+                return False
+            database.reset_credit_not_found(oid)
             log.error("%s Credit Broker: /info недоступен order=%s — повтор", source, oid)
             return False
+        database.reset_credit_not_found(oid)
         database.set_tbank_status(oid, str(info.status))
 
         # терминальный негатив — доступ не выдаём ни при одном из статусов.
@@ -1117,7 +1145,11 @@ def create_app(
             await asyncio.sleep(interval)
             set_request_id(f"poll-credit-{str(uuid.uuid4())[:8]}")
             try:
-                orders = database.get_pending_credit_orders(methods, CREDIT_POLL_MAX_AGE_SECONDS)
+                orders = database.get_pending_credit_orders(
+                    methods,
+                    CREDIT_POLL_MAX_AGE_SECONDS,
+                    CREDIT_INFO_NOT_FOUND_MAX_ATTEMPTS,
+                )
                 total = len(orders)
                 ok_count = err_count = 0
                 for order in orders:
