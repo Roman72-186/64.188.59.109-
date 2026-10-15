@@ -23,6 +23,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator, Optional
 
 ACTIVE_LINK_MAX_AGE_SECONDS = 3600  # PRD §7.2: активная ссылка живёт 1 час
+# Защита от двойного нажатия при force=True: оплата того же товара на ту же сумму
+# моложе этого окна считается дублем, а не новой покупкой (продление через месяц
+# под окно не попадает).
+RECENT_PAID_WINDOW_SECONDS = 30 * 60
 
 
 def _utcnow() -> str:
@@ -149,21 +153,26 @@ class Database:
         product_id: str,
         payment_method: str,
         max_age_seconds: int = ACTIVE_LINK_MAX_AGE_SECONDS,
+        amount: Optional[int] = None,
     ) -> Optional[dict[str, Any]]:
         """PRD §7.2: неоплаченная ссылка (status='pending', есть pay_url),
-        созданная не более max_age_seconds назад."""
+        созданная не более max_age_seconds назад. `amount` — только ссылка
+        на ту же сумму (копейки)."""
         threshold = (
             datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
         ).isoformat()
+        sql = (
+            "SELECT * FROM payments "
+            "WHERE contact_id = ? AND product_id = ? AND payment_method = ? "
+            "  AND status = 'pending' AND pay_url IS NOT NULL "
+            "  AND created_at >= ? "
+        )
+        params: list[Any] = [contact_id, product_id, payment_method, threshold]
+        if amount is not None:
+            sql += "  AND amount = ? "
+            params.append(amount)
         with self._connect() as conn:
-            cur = conn.execute(
-                "SELECT * FROM payments "
-                "WHERE contact_id = ? AND product_id = ? AND payment_method = ? "
-                "  AND status = 'pending' AND pay_url IS NOT NULL "
-                "  AND created_at >= ? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (contact_id, product_id, payment_method, threshold),
-            )
+            cur = conn.execute(sql + "ORDER BY created_at DESC LIMIT 1", params)
             return self._row(cur.fetchone())
 
     def get_pending_credit_orders(
@@ -257,17 +266,30 @@ class Database:
             )
 
     def find_paid_order(
-        self, contact_id: str, product_id: str
+        self,
+        contact_id: str,
+        product_id: str,
+        paid_within_seconds: Optional[int] = None,
+        amount: Optional[int] = None,
     ) -> Optional[dict[str, Any]]:
         """PRD §7.3: любой платёж по товару, подтверждённый банком (paid_at IS NOT NULL),
-        независимо от того, назначен ли уже тег."""
+        независимо от того, назначен ли уже тег. `paid_within_seconds` и `amount` —
+        только свежая оплата на ту же сумму (защита от двойного нажатия при force)."""
+        sql = (
+            "SELECT * FROM payments "
+            "WHERE contact_id = ? AND product_id = ? AND paid_at IS NOT NULL "
+        )
+        params: list[Any] = [contact_id, product_id]
+        if paid_within_seconds is not None:
+            sql += "  AND paid_at >= ? "
+            params.append((
+                datetime.now(timezone.utc) - timedelta(seconds=paid_within_seconds)
+            ).isoformat())
+        if amount is not None:
+            sql += "  AND amount = ? "
+            params.append(amount)
         with self._connect() as conn:
-            cur = conn.execute(
-                "SELECT * FROM payments "
-                "WHERE contact_id = ? AND product_id = ? AND paid_at IS NOT NULL "
-                "ORDER BY id DESC LIMIT 1",
-                (contact_id, product_id),
-            )
+            cur = conn.execute(sql + "ORDER BY id DESC LIMIT 1", params)
             return self._row(cur.fetchone())
 
     # ── запись ──────────────────────────────────────────────────────────────

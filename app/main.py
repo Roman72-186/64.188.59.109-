@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .config import AppConfig, get_config
 from .cloudkassir import CloudKassirClient
-from .database import Database
+from .database import RECENT_PAID_WINDOW_SECONDS, Database
 from .dolyame import (
     STATUS_COMMITTED,
     STATUS_FAIL_TAG as DOLYAME_STATUS_FAIL_TAG,
@@ -703,12 +703,18 @@ def create_app(
                 effective_method = credit_method
 
         # 4. товар уже оплачен (PRD §7.3). force=True означает новое оформление:
-        #    ранее успешная оплата не должна блокировать повторную покупку.
-        paid = (
-            None
-            if req.force
-            else database.find_paid_order(req.contact_id, req.product_id)
-        )
+        #    ранее успешная оплата не блокирует повторную покупку (продление), но
+        #    оплата того же товара на ту же сумму за последние 30 минут — это
+        #    двойное нажатие «Оплатить», второй платёж не создаём. Бот Школы шлёт
+        #    force=True на каждое нажатие (с 01.10 — 112 из 112), и без этой
+        #    проверки люди платили дважды (2922635: 2×5000 ₽ за 5 минут, 26.08).
+        if req.force:
+            paid = database.find_paid_order(
+                req.contact_id, req.product_id,
+                paid_within_seconds=RECENT_PAID_WINDOW_SECONDS, amount=amount,
+            )
+        else:
+            paid = database.find_paid_order(req.contact_id, req.product_id)
         if paid is not None:
             if paid["tag_assigned_at"]:
                 log.info(
@@ -730,17 +736,22 @@ def create_app(
             )
             return _resp(status, 200, order_id=paid["order_id"], pay_url=paid["pay_url"])
 
-        # 5. активная неоплаченная ссылка (PRD §7.2) — пропускаем при force=True
-        if not req.force:
-            active = database.find_active_link(
-                req.contact_id, req.product_id, effective_method
+        # 5. активная неоплаченная ссылка (PRD §7.2). При force=True — только на ту
+        #    же сумму: повторное нажатие получает прежнюю ссылку, а не второй живой
+        #    платёж в банке; другая сумма (сменили тариф) — новая ссылка.
+        active = database.find_active_link(
+            req.contact_id, req.product_id, effective_method,
+            amount=amount if req.force else None,
+        )
+        if active is not None:
+            log.info(
+                "init-payment: возврат активной ссылки order=%s force=%s",
+                active["order_id"], req.force,
             )
-            if active is not None:
-                log.info("init-payment: возврат активной ссылки order=%s", active["order_id"])
-                return _resp(
-                    InitStatus.EXISTING_ACTIVE, 200,
-                    order_id=active["order_id"], pay_url=active["pay_url"],
-                )
+            return _resp(
+                InitStatus.EXISTING_ACTIVE, 200,
+                order_id=active["order_id"], pay_url=active["pay_url"],
+            )
 
         # 6. создание нового платежа
         order_id = f"{req.product_id}_{req.contact_id}_{secrets.token_hex(4)}"

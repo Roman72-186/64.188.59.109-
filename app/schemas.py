@@ -37,7 +37,11 @@ class InitPaymentRequest(BaseModel):
     amount: Optional[int] = Field(default=None, gt=0, description="сумма в копейках — формируется платформой")
     force: bool = Field(
         default=False,
-        description="начать новое оформление: не учитывать прежнюю оплату и активную ссылку",
+        description=(
+            "начать новое оформление: прежняя оплата не блокирует покупку, кроме оплаты "
+            "той же суммы за последние 30 минут; активная ссылка на ту же сумму "
+            "возвращается (защита от двойного нажатия)"
+        ),
     )
     # Контакт для чека 54-ФЗ (опционально; иначе берётся fallback из config.receipt)
     email: Optional[str] = Field(default=None, description="email покупателя для чека")
